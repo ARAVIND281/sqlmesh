@@ -1684,16 +1684,6 @@ class GenericContext(BaseContext, t.Generic[C]):
                 plan_execution_time,
             )
 
-            if (
-                start
-                and default_end
-                and to_datetime(start, relative_base=to_datetime(plan_execution_time))
-                > to_datetime(default_end)
-            ):
-                # If the requested start is newer than prod's latest interval end, fall back to execution time
-                # instead of forcing an invalid [start, default_end] range.
-                default_start, default_end = None, None
-
             # Refresh snapshot intervals to ensure that they are up to date with values reflected in the max_interval_end_per_model.
             self.state_sync.refresh_snapshot_intervals(context_diff.snapshots.values())
             max_interval_end_per_model = self._filter_stale_end_overrides(

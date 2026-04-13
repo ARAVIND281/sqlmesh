@@ -38,7 +38,7 @@ from sqlmesh.core.engine_adapter.duckdb import DuckDBEngineAdapter
 from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
 from sqlmesh.core.plan.definition import Plan
 from sqlmesh.core.macros import MacroEvaluator, RuntimeStage
-from sqlmesh.core.model import load_sql_based_model, model, SqlModel, Model
+from sqlmesh.core.model import SeedModel, load_sql_based_model, model, SqlModel, Model
 from sqlmesh.core.model.common import ParsableSql
 from sqlmesh.core.model.cache import OptimizedQueryCache
 from sqlmesh.core.renderer import render_statements
@@ -1224,7 +1224,9 @@ def test_plan_seed_model_excluded_from_default_end(copy_to_temp_path: t.Callable
 
 
 @pytest.mark.slow
-def test_seed_model_pr_plan_with_stale_prod_intervals(copy_to_temp_path: t.Callable):
+def test_seed_model_pr_plan_filters_stale_end_override(
+    copy_to_temp_path: t.Callable, mocker: MockerFixture
+):
     path = copy_to_temp_path("examples/sushi")
 
     with time_machine.travel("2024-06-01 00:00:00 UTC"):
@@ -1235,27 +1237,67 @@ def test_seed_model_pr_plan_with_stale_prod_intervals(copy_to_temp_path: t.Calla
     with time_machine.travel("2026-04-13 00:00:00 UTC"):
         context = Context(paths=path, gateway="duckdb_persistent")
 
-        model = context.get_model("sushi.waiter_names").copy()
+        model = t.cast(SeedModel, context.get_model("sushi.waiter_names").copy())
         model.seed.content += "10,Trey\n"
         context.upsert_model(model)
+        context.upsert_model(
+            load_sql_based_model(
+                parse(
+                    """
+                    MODEL (
+                        name sushi.waiter_rollup,
+                        kind FULL,
+                        cron '@daily'
+                    );
+
+                    SELECT waiter_id, waiter_name, event_date
+                    FROM sushi.waiter_as_customer_by_day
+                    """
+                ),
+                default_catalog=context.default_catalog,
+            )
+        )
+
+        waiter_as_customer_by_day = context.get_snapshot(
+            "sushi.waiter_as_customer_by_day", raise_if_missing=True
+        )
+        orders = context.get_snapshot("sushi.orders", raise_if_missing=True)
+        original_get_max_interval_end_per_model = context._get_max_interval_end_per_model
+
+        def _mocked_max_interval_end_per_model(
+            snapshots: t.Dict[str, t.Any], backfill_models: t.Optional[t.Set[str]]
+        ) -> t.Dict[str, datetime]:
+            result = original_get_max_interval_end_per_model(snapshots, backfill_models)
+            # Keep the overall plan end recent via another affected model while making the old prod end for
+            # waiter_as_customer_by_day older than the PR start. Without filtering, that stale end_override
+            # causes the new waiter_as_customer_by_day snapshot to be skipped and waiter_rollup fails when it
+            # references the missing physical table.
+            result[waiter_as_customer_by_day.name] = to_datetime("2026-01-01")
+            result[orders.name] = to_datetime("2026-04-13")
+            return result
+
+        mocker.patch.object(
+            context,
+            "_get_max_interval_end_per_model",
+            side_effect=_mocked_max_interval_end_per_model,
+        )
 
         plan = context.plan("dev", start="2 months ago", no_prompts=True)
         missing_interval_names = {si.snapshot_id.name for si in plan.missing_intervals}
 
         assert plan.user_provided_flags == {"start": "2 months ago"}
-        assert plan.provided_end is None
         assert to_timestamp(plan.start) == to_timestamp("2026-02-13")
         assert to_timestamp(plan.end) == to_timestamp("2026-04-13")
-        assert any("waiter_names" in name for name in missing_interval_names)
         assert any("waiter_as_customer_by_day" in name for name in missing_interval_names)
+        assert any("waiter_rollup" in name for name in missing_interval_names)
 
         context.apply(plan)
 
-        promoted_snapshot_names = {
-            snapshot.name for snapshot in context.state_sync.get_environment("dev").promoted_snapshots
-        }
-        assert any("waiter_names" in name for name in promoted_snapshot_names)
+        environment = context.state_sync.get_environment("dev")
+        assert environment is not None
+        promoted_snapshot_names = {snapshot.name for snapshot in environment.promoted_snapshots}
         assert any("waiter_as_customer_by_day" in name for name in promoted_snapshot_names)
+        assert any("waiter_rollup" in name for name in promoted_snapshot_names)
         context.close()
 
 
