@@ -1224,6 +1224,42 @@ def test_plan_seed_model_excluded_from_default_end(copy_to_temp_path: t.Callable
 
 
 @pytest.mark.slow
+def test_seed_model_pr_plan_with_stale_prod_intervals(copy_to_temp_path: t.Callable):
+    path = copy_to_temp_path("examples/sushi")
+
+    with time_machine.travel("2024-06-01 00:00:00 UTC"):
+        context = Context(paths=path, gateway="duckdb_persistent")
+        context.plan("prod", no_prompts=True, auto_apply=True)
+        context.close()
+
+    with time_machine.travel("2026-04-13 00:00:00 UTC"):
+        context = Context(paths=path, gateway="duckdb_persistent")
+
+        model = context.get_model("sushi.waiter_names").copy()
+        model.seed.content += "10,Trey\n"
+        context.upsert_model(model)
+
+        plan = context.plan("dev", start="2 months ago", no_prompts=True)
+        missing_interval_names = {si.snapshot_id.name for si in plan.missing_intervals}
+
+        assert plan.user_provided_flags == {"start": "2 months ago"}
+        assert plan.provided_end is None
+        assert to_timestamp(plan.start) == to_timestamp("2026-02-13")
+        assert to_timestamp(plan.end) == to_timestamp("2026-04-13")
+        assert any("waiter_names" in name for name in missing_interval_names)
+        assert any("waiter_as_customer_by_day" in name for name in missing_interval_names)
+
+        context.apply(plan)
+
+        promoted_snapshot_names = {
+            snapshot.name for snapshot in context.state_sync.get_environment("dev").promoted_snapshots
+        }
+        assert any("waiter_names" in name for name in promoted_snapshot_names)
+        assert any("waiter_as_customer_by_day" in name for name in promoted_snapshot_names)
+        context.close()
+
+
+@pytest.mark.slow
 def test_schema_error_no_default(sushi_context_pre_scheduling) -> None:
     context = sushi_context_pre_scheduling
 

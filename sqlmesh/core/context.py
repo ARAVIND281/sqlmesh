@@ -1666,6 +1666,7 @@ class GenericContext(BaseContext, t.Generic[C]):
             # This ensures that no models outside the impacted sub-DAG(s) will be backfilled unexpectedly.
             backfill_models = modified_model_names or None
 
+        plan_execution_time = execution_time or now()
         max_interval_end_per_model = None
         default_start, default_end = None, None
         if not run:
@@ -1680,17 +1681,31 @@ class GenericContext(BaseContext, t.Generic[C]):
                 max_interval_end_per_model,
                 backfill_models,
                 modified_model_names,
-                execution_time or now(),
+                plan_execution_time,
             )
+
+            if (
+                start
+                and default_end
+                and to_datetime(start, relative_base=to_datetime(plan_execution_time))
+                > to_datetime(default_end)
+            ):
+                # If the requested start is newer than prod's latest interval end, fall back to execution time
+                # instead of forcing an invalid [start, default_end] range.
+                default_start, default_end = None, None
 
             # Refresh snapshot intervals to ensure that they are up to date with values reflected in the max_interval_end_per_model.
             self.state_sync.refresh_snapshot_intervals(context_diff.snapshots.values())
+            max_interval_end_per_model = self._filter_stale_end_overrides(
+                max_interval_end_per_model,
+                context_diff.snapshots_by_name,
+            )
 
         start_override_per_model = self._calculate_start_override_per_model(
             min_intervals,
             start or default_start,
             end or default_end,
-            execution_time or now(),
+            plan_execution_time,
             backfill_models,
             snapshots,
             max_interval_end_per_model,
@@ -3179,6 +3194,20 @@ class GenericContext(BaseContext, t.Generic[C]):
                 models=models_for_interval_end,
                 ensure_finalized_snapshots=self.config.plan.use_finalized_state,
             ).items()
+        }
+
+    @staticmethod
+    def _filter_stale_end_overrides(
+        max_interval_end_per_model: t.Dict[str, datetime],
+        snapshots_by_name: t.Dict[str, Snapshot],
+    ) -> t.Dict[str, datetime]:
+        # Drop stale interval ends for snapshots whose new versions have no intervals yet. Otherwise the old
+        # prod end is reused as an end_override, causing missing_intervals() to skip the new snapshot entirely
+        # when the requested start is newer than that stale end.
+        return {
+            model_fqn: end
+            for model_fqn, end in max_interval_end_per_model.items()
+            if model_fqn not in snapshots_by_name or snapshots_by_name[model_fqn].intervals
         }
 
     @staticmethod
