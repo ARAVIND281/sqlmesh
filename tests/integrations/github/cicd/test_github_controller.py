@@ -509,6 +509,210 @@ def test_update_sqlmesh_comment_info(
         assert created_comments[0].body == create_comment
 
 
+def test_update_pr_environment_posts_tobiko_cloud_plan_link(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_issue = github_client.get_repo().get_issue()
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: created_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        mock_out_context=False,
+    )
+    plan_id = controller.pr_plan.plan_id
+
+    _update_pr_environment(controller)
+
+    assert len(created_comments) == 2
+    plan_comment = created_comments[0].body
+    assert "<!-- sqlmesh-pr-plan-link -->" in plan_comment
+    assert "SQLMesh PR environment plan progress." in plan_comment
+    assert (
+        f"https://cloud.tobikodata.com/org/project/environments/hello_world_2/plans/{plan_id}"
+        in plan_comment
+    )
+
+
+def test_update_pr_environment_does_not_post_tobiko_cloud_plan_link_without_cloud_url(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_issue = github_client.get_repo().get_issue()
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: created_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.delenv("TCLOUD_URL", raising=False)
+    monkeypatch.delenv("TCLOUD_BASE_URL", raising=False)
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        mock_out_context=False,
+    )
+
+    _update_pr_environment(controller)
+
+    assert len(created_comments) == 1
+    assert "<!-- sqlmesh-pr-plan-link -->" not in created_comments[0].body
+
+
+def test_update_pr_environment_does_not_post_tobiko_cloud_plan_link_for_noop_plan(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_issue = github_client.get_repo().get_issue()
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: created_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+    mocker.patch(
+        "sqlmesh.core.context_diff.ContextDiff.has_changes",
+        PropertyMock(return_value=False),
+    )
+    mocker.patch(
+        "sqlmesh.core.plan.definition.Plan.requires_backfill",
+        PropertyMock(return_value=False),
+    )
+    mocker.patch(
+        "sqlmesh.core.plan.definition.Plan.has_unmodified_unpromoted",
+        PropertyMock(return_value=False),
+    )
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        mock_out_context=False,
+    )
+
+    _update_pr_environment(controller)
+
+    assert len(created_comments) == 1
+    assert "<!-- sqlmesh-pr-plan-link -->" not in created_comments[0].body
+
+
+def test_update_pr_environment_clears_existing_tobiko_cloud_plan_link_for_noop_plan(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    existing_plan_comment = MockIssueComment(body="<!-- sqlmesh-pr-plan-link -->\n\nOld link")
+    existing_comments = [existing_plan_comment]
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue = github_client.get_repo().get_issue()
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: existing_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+    mocker.patch(
+        "sqlmesh.core.context_diff.ContextDiff.has_changes",
+        PropertyMock(return_value=False),
+    )
+    mocker.patch(
+        "sqlmesh.core.plan.definition.Plan.requires_backfill",
+        PropertyMock(return_value=False),
+    )
+    mocker.patch(
+        "sqlmesh.core.plan.definition.Plan.has_unmodified_unpromoted",
+        PropertyMock(return_value=False),
+    )
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        mock_out_context=False,
+    )
+
+    _update_pr_environment(controller)
+
+    assert len(created_comments) == 1
+    assert existing_plan_comment.body == "<!-- sqlmesh-pr-plan-link -->\n\nNo current SQLMesh plan."
+
+
+def test_update_pr_environment_plan_link_uses_tcloud_base_url(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_issue = github_client.get_repo().get_issue()
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: created_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.delenv("TCLOUD_URL", raising=False)
+    monkeypatch.setenv("TCLOUD_BASE_URL", "https://cloud.tobikodata.com/base/project/")
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        mock_out_context=False,
+    )
+    plan_id = controller.pr_plan.plan_id
+
+    _update_pr_environment(controller)
+
+    assert (
+        f"https://cloud.tobikodata.com/base/project/environments/hello_world_2/plans/{plan_id}"
+        in created_comments[0].body
+    )
+
+
+def test_update_pr_environment_plan_link_updates_existing_comment(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    existing_plan_comment = MockIssueComment(body="<!-- sqlmesh-pr-plan-link -->\n\nOld link")
+    existing_comments = [existing_plan_comment]
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue = github_client.get_repo().get_issue()
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: existing_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        mock_out_context=False,
+    )
+    plan_id = controller.pr_plan.plan_id
+
+    _update_pr_environment(controller)
+
+    assert len(created_comments) == 1
+    assert f"/environments/hello_world_2/plans/{plan_id}" in existing_plan_comment.body
+    assert "Old link" not in existing_plan_comment.body
+
+
 def test_deploy_to_prod_merge_error(github_client, make_controller):
     mock_pull_request = github_client.get_repo().get_pull()
     mock_pull_request.merged = True
@@ -547,6 +751,178 @@ def test_deploy_to_prod_not_blocked_pr_if_config_set(github_client, make_control
         bot_config=GithubCICDBotConfig(check_if_blocked_on_deploy_to_prod=False),
     )
     controller.deploy_to_prod()
+
+
+def test_deploy_to_prod_posts_tobiko_cloud_plan_link(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_pull_request = github_client.get_repo().get_pull()
+    mock_pull_request.merged = False
+    mock_issue = github_client.get_repo().get_issue()
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: created_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json", github_client
+    )
+    plan_id = controller.prod_plan.plan_id
+
+    controller.deploy_to_prod()
+
+    assert len(created_comments) == 2
+    prod_plan_comment = created_comments[1].body
+    assert "<!-- sqlmesh-prod-plan-link -->" in prod_plan_comment
+    assert "SQLMesh production deploy plan." in prod_plan_comment
+    assert (
+        f"https://cloud.tobikodata.com/org/project/environments/prod/plans/{plan_id}"
+        in prod_plan_comment
+    )
+
+
+def test_deploy_to_prod_does_not_post_tobiko_cloud_plan_link_without_cloud_url(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_pull_request = github_client.get_repo().get_pull()
+    mock_pull_request.merged = False
+    mock_issue = github_client.get_repo().get_issue()
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: created_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.delenv("TCLOUD_URL", raising=False)
+    monkeypatch.delenv("TCLOUD_BASE_URL", raising=False)
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json", github_client
+    )
+
+    controller.deploy_to_prod()
+
+    assert len(created_comments) == 1
+    assert "<!-- sqlmesh-prod-plan-link -->" not in created_comments[0].body
+
+
+def test_deploy_to_prod_posts_tobiko_cloud_plan_link_if_apply_fails(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_pull_request = github_client.get_repo().get_pull()
+    mock_pull_request.merged = False
+    mock_issue = github_client.get_repo().get_issue()
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: created_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json", github_client
+    )
+    plan_id = controller.prod_plan.plan_id
+    controller._context.apply = mocker.MagicMock(side_effect=SQLMeshError("apply failed"))
+
+    with pytest.raises(SQLMeshError, match="apply failed"):
+        controller.deploy_to_prod()
+
+    assert len(created_comments) == 2
+    assert "<!-- sqlmesh-prod-plan-link -->" in created_comments[1].body
+    assert f"/environments/prod/plans/{plan_id}" in created_comments[1].body
+
+
+def test_deploy_to_prod_updates_existing_tobiko_cloud_plan_link(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_pull_request = github_client.get_repo().get_pull()
+    mock_pull_request.merged = False
+    existing_prod_plan_comment = MockIssueComment(
+        body="<!-- sqlmesh-prod-plan-link -->\n\nOld link"
+    )
+    existing_comments = [existing_prod_plan_comment]
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue = github_client.get_repo().get_issue()
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: existing_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json", github_client
+    )
+    plan_id = controller.prod_plan.plan_id
+
+    controller.deploy_to_prod()
+
+    assert len(created_comments) == 1
+    assert f"/environments/prod/plans/{plan_id}" in existing_prod_plan_comment.body
+    assert "Old link" not in existing_prod_plan_comment.body
+
+
+def test_deploy_to_prod_clears_existing_tobiko_cloud_plan_link_for_noop_plan(
+    github_client,
+    make_mock_issue_comment,
+    make_controller: t.Callable[..., GithubController],
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    mock_pull_request = github_client.get_repo().get_pull()
+    mock_pull_request.merged = False
+    existing_prod_plan_comment = MockIssueComment(
+        body="<!-- sqlmesh-prod-plan-link -->\n\nOld link"
+    )
+    existing_comments = [existing_prod_plan_comment]
+    created_comments: t.List[MockIssueComment] = []
+    mock_issue = github_client.get_repo().get_issue()
+    mock_issue.get_comments = mocker.MagicMock(side_effect=lambda: existing_comments)
+    mock_issue.create_comment = mocker.MagicMock(
+        side_effect=lambda body: make_mock_issue_comment(body, created_comments)
+    )
+    monkeypatch.setenv("TCLOUD_URL", "https://cloud.tobikodata.com/org/project/")
+    mocker.patch(
+        "sqlmesh.core.context_diff.ContextDiff.has_changes",
+        PropertyMock(return_value=False),
+    )
+    mocker.patch(
+        "sqlmesh.core.plan.definition.Plan.requires_backfill",
+        PropertyMock(return_value=False),
+    )
+    mocker.patch(
+        "sqlmesh.core.plan.definition.Plan.has_unmodified_unpromoted",
+        PropertyMock(return_value=False),
+    )
+
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json", github_client
+    )
+
+    controller.deploy_to_prod()
+
+    assert len(created_comments) == 1
+    assert (
+        existing_prod_plan_comment.body
+        == "<!-- sqlmesh-prod-plan-link -->\n\nNo current SQLMesh plan."
+    )
 
 
 def test_deploy_to_prod_dirty_pr(github_client, make_controller):
@@ -709,9 +1085,16 @@ def test_uncategorized(
 
     github_output_file = tmp_path / "github_output.txt"
 
-    with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(github_output_file)}):
+    with mock.patch.dict(
+        os.environ,
+        {
+            "GITHUB_OUTPUT": str(github_output_file),
+            "TCLOUD_URL": "https://cloud.tobikodata.com/org/project/",
+        },
+    ):
         _update_pr_environment(controller)
 
+    assert not created_comments
     assert "SQLMesh - PR Environment Synced" in controller._check_run_mapping
     pr_environment_check_run = controller._check_run_mapping[
         "SQLMesh - PR Environment Synced"

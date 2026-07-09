@@ -56,6 +56,9 @@ if t.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+PR_ENVIRONMENT_PLAN_LINK_COMMENT_MARKER = "<!-- sqlmesh-pr-plan-link -->"
+PROD_PLAN_LINK_COMMENT_MARKER = "<!-- sqlmesh-prod-plan-link -->"
+
 
 class TestFailure(Exception):
     pass
@@ -678,15 +681,18 @@ class GithubController:
         self._context.lint_models()
 
     def _get_or_create_comment(self, header: str = BOT_HEADER_MSG) -> IssueComment:
-        comment = seq_get(
-            [comment for comment in self._issue.get_comments() if header in comment.body],
-            0,
-        )
+        comment = self._get_comment(header=header)
         if not comment:
             logger.debug(f"Did not find comment so creating one with header: {header}")
             return self._issue.create_comment(header)
         logger.debug(f"Found comment with header: {header}")
         return comment
+
+    def _get_comment(self, header: str) -> t.Optional[IssueComment]:
+        return seq_get(
+            [comment for comment in self._issue.get_comments() if header in comment.body],
+            0,
+        )
 
     def _get_merge_state_status(self) -> MergeStateStatus:
         """
@@ -741,13 +747,59 @@ class GithubController:
         comment.edit(body=body)
         return True, comment
 
+    def update_pr_environment_plan_comment(self, plan: Plan) -> None:
+        self._update_tobiko_cloud_plan_comment(
+            plan=plan,
+            environment=self.pr_environment_name,
+            marker=PR_ENVIRONMENT_PLAN_LINK_COMMENT_MARKER,
+            description="SQLMesh PR environment plan progress.",
+            link_label=f"Tobiko Cloud / environments / {self.pr_environment_name} / plans / {plan.plan_id}",
+        )
+
+    def update_prod_plan_comment(self, plan: Plan) -> None:
+        self._update_tobiko_cloud_plan_comment(
+            plan=plan,
+            environment=c.PROD,
+            marker=PROD_PLAN_LINK_COMMENT_MARKER,
+            description="SQLMesh production deploy plan.",
+            link_label=f"Tobiko Cloud / environments / {c.PROD} / plans / {plan.plan_id}",
+        )
+
+    def _update_tobiko_cloud_plan_comment(
+        self,
+        *,
+        plan: Plan,
+        environment: str,
+        marker: str,
+        description: str,
+        link_label: str,
+    ) -> None:
+        cloud_url = os.environ.get("TCLOUD_URL") or os.environ.get("TCLOUD_BASE_URL")
+        if not cloud_url:
+            return
+        if (
+            not plan.context_diff.has_changes
+            and not plan.requires_backfill
+            and not plan.has_unmodified_unpromoted
+        ):
+            if comment := self._get_comment(header=marker):
+                comment.edit(body=f"{marker}\n\nNo current SQLMesh plan.")
+            return
+
+        plan_url = f"{cloud_url.rstrip('/')}/environments/{environment}/plans/{plan.plan_id}"
+        body = f"{marker}\n\n{description}\n\nPlan: [{link_label}]({plan_url})"
+        comment = self._get_or_create_comment(header=marker)
+        comment.edit(body=body)
+
     def update_pr_environment(self) -> None:
         """
         Creates a PR environment from the logic present in the PR. If the PR contains changes that are
         uncategorized, then an error will be raised.
         """
         self._console.consume_captured_output()  # clear output buffer
-        self._context.apply(self.pr_plan)  # will raise if PR environment creation fails
+        plan = self.pr_plan
+        self._context.apply(plan)  # will raise if PR environment creation fails
+        self.update_pr_environment_plan_comment(plan)
 
         # update PR info comment
         vde_title = "- :eyes: To **review** this PR's changes, use virtual data environment:"
@@ -800,7 +852,9 @@ class GithubController:
             value=plan_summary,
             dedup_regex=None,
         )
-        self._context.apply(self.prod_plan)
+        plan = self.prod_plan
+        self.update_prod_plan_comment(plan)
+        self._context.apply(plan)
 
     def try_invalidate_pr_environment(self) -> None:
         """

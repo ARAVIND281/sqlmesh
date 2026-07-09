@@ -59,6 +59,8 @@ jobs:
 
 Next checkout the [Core Bot Behavior Configuration Guide](#core-bot-behavior-configuration-guide) to see how to configure the bot's core behavior. Then checkout [Bot Configuration](#bot-configuration) to see how to configure the bot's behavior in general. Finally, checkout [Custom Workflow Configuration](#custom-workflow-configuration) to see the full set of customizations available to the bot.
 
+If the workflow runs SQLMesh through Tobiko Cloud, set `TCLOUD_URL` or `TCLOUD_BASE_URL` in the workflow environment. When one of these variables is present, the bot adds or updates pull request comments with links to Tobiko Cloud plans for PR environments and production deploys.
+
 ## Core Bot Behavior Configuration Guide
 
 There are two fundamental ways the bot can be configured: synchronized or desynchronized production code and data.
