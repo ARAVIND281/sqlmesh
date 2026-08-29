@@ -18,7 +18,7 @@ from functools import cached_property, partial
 
 from sqlglot import Dialect, exp
 from sqlglot.errors import ErrorLevel
-from sqlglot.helper import ensure_list
+from sqlglot.helper import ensure_list, seq_get
 from sqlglot.optimizer.qualify_columns import quote_identifiers
 
 from sqlmesh.core.dialect import (
@@ -63,6 +63,7 @@ if t.TYPE_CHECKING:
     from sqlmesh.core.engine_adapter._typing import (
         DF,
         BigframeSession,
+        GrantsConfig,
         PySparkDataFrame,
         PySparkSession,
         Query,
@@ -113,12 +114,19 @@ class EngineAdapter:
     SCHEMA_DIFFER_KWARGS: t.Dict[str, t.Any] = {}
     SUPPORTS_TUPLE_IN = True
     HAS_VIEW_BINDING = False
+    RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = True
     SUPPORTS_REPLACE_TABLE = True
+    SUPPORTS_GRANTS = False
     DEFAULT_CATALOG_TYPE = DIALECT
     QUOTE_IDENTIFIERS_IN_VIEWS = True
     MAX_IDENTIFIER_LENGTH: t.Optional[int] = None
     ATTACH_CORRELATION_ID = True
     SUPPORTS_QUERY_EXECUTION_TRACKING = False
+    SUPPORTS_METADATA_TABLE_LAST_MODIFIED_TS = False
+    RESOLVE_TABLE_REFS_IN_PHYSICAL_PROPERTIES: t.FrozenSet[str] = frozenset()
+    """Physical property keys whose values may contain logical model references that
+    should be resolved to physical table names during property rendering.  Engines that
+    need such resolution (e.g. StarRocks' excluded_trigger_tables) override this set."""
 
     def __init__(
         self,
@@ -160,6 +168,7 @@ class EngineAdapter:
         self.correlation_id = correlation_id
         self._schema_differ_overrides = schema_differ_overrides
         self._query_execution_tracker = query_execution_tracker
+        self._data_object_cache: t.Dict[str, t.Optional[DataObject]] = {}
 
     def with_settings(self, **kwargs: t.Any) -> EngineAdapter:
         extra_kwargs = {
@@ -169,6 +178,7 @@ class EngineAdapter:
             "query_execution_tracker": kwargs.pop(
                 "query_execution_tracker", self._query_execution_tracker
             ),
+            "pre_ping": kwargs.pop("pre_ping", self._pre_ping),
             **self._extra_config,
             **kwargs,
         }
@@ -214,6 +224,31 @@ class EngineAdapter:
     def catalog_support(self) -> CatalogSupport:
         return CatalogSupport.UNSUPPORTED
 
+    def supports_virtual_catalog(self) -> bool:
+        """Return True if this adapter can accept a virtual catalog for multi-gateway nesting alignment.
+
+        When a project mixes catalog-aware gateways (e.g. DuckDB) with catalog-unsupported gateways
+        (e.g. ClickHouse), all adapters need a uniform 3-level FQN so MappingSchema nesting stays
+        consistent. Adapters that return True here opt in to receiving an injected virtual catalog
+        via inject_virtual_catalog(), which causes the set_catalog decorator to strip the catalog
+        from DDL expressions rather than raising UnsupportedCatalogOperationError.
+        """
+        return False
+
+    def inject_virtual_catalog(self, gateway: str) -> None:
+        """Inject a gateway name to configure the adapter's virtual catalog.
+
+        The adapter determines the final catalog name from the gateway name (e.g. ClickHouse
+        wraps it as __{gateway}__). Only call this on adapters that return True from
+        supports_virtual_catalog(). After injection, catalog_support should return
+        SINGLE_CATALOG_ONLY so the set_catalog decorator strips the virtual catalog from DDL
+        expressions instead of raising an error.
+        """
+        raise NotImplementedError(
+            f"{self.dialect} does not support virtual catalog injection. "
+            "Override supports_virtual_catalog() to return True and implement inject_virtual_catalog()."
+        )
+
     @cached_property
     def schema_differ(self) -> SchemaDiffer:
         return SchemaDiffer(
@@ -223,12 +258,16 @@ class EngineAdapter:
             }
         )
 
+    @property
+    def _catalog_type_overrides(self) -> t.Dict[str, str]:
+        return self._extra_config.get("catalog_type_overrides") or {}
+
     @classmethod
     def _casted_columns(
         cls,
         target_columns_to_types: t.Dict[str, exp.DataType],
         source_columns: t.Optional[t.List[str]] = None,
-    ) -> t.List[exp.Alias]:
+    ) -> t.List[exp.Expr]:
         source_columns_lookup = set(source_columns or target_columns_to_types)
         return [
             exp.alias_(
@@ -287,8 +326,8 @@ class EngineAdapter:
                         )
                         for c in target_columns_to_types
                     ]
-                    query_factory = (
-                        lambda: exp.Select()
+                    query_factory = lambda: (
+                        exp.Select()
                         .select(*select_columns)
                         .from_(query_or_df.subquery("select_source_columns"))
                     )
@@ -430,7 +469,11 @@ class EngineAdapter:
             raise UnsupportedCatalogOperationError(
                 f"{self.dialect} does not support catalogs and a catalog was provided: {catalog}"
             )
-        return self.DEFAULT_CATALOG_TYPE
+        return (
+            self._catalog_type_overrides.get(catalog, self.DEFAULT_CATALOG_TYPE)
+            if catalog
+            else self.DEFAULT_CATALOG_TYPE
+        )
 
     def get_catalog_type_from_table(self, table: TableName) -> str:
         """Get the catalog type from a table name if it has a catalog specified, otherwise return the current catalog type"""
@@ -539,11 +582,13 @@ class EngineAdapter:
                     target_table,
                     source_queries,
                     target_columns_to_types,
+                    **kwargs,
                 )
         return self._insert_overwrite_by_condition(
             target_table,
             source_queries,
             target_columns_to_types,
+            **kwargs,
         )
 
     def create_index(
@@ -577,7 +622,7 @@ class EngineAdapter:
 
     def _pop_creatable_type_from_properties(
         self,
-        properties: t.Dict[str, exp.Expression],
+        properties: t.Dict[str, exp.Expr],
     ) -> t.Optional[exp.Property]:
         """Pop out the creatable_type from the properties dictionary (if exists (return it/remove it) else return none).
         It also checks that none of the expressions are MATERIALIZE as that conflicts with the `materialize` parameter.
@@ -638,9 +683,9 @@ class EngineAdapter:
         table_name: TableName,
         query: Query,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
-        partitioned_by: t.Optional[t.List[exp.Expression]] = None,
-        clustered_by: t.Optional[t.List[exp.Expression]] = None,
-        table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        partitioned_by: t.Optional[t.List[exp.Expr]] = None,
+        clustered_by: t.Optional[t.List[exp.Expr]] = None,
+        table_properties: t.Optional[t.Dict[str, exp.Expr]] = None,
         table_description: t.Optional[str] = None,
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
         source_columns: t.Optional[t.List[str]] = None,
@@ -797,6 +842,7 @@ class EngineAdapter:
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
         expressions: t.Optional[t.List[exp.PrimaryKey]] = None,
         is_view: bool = False,
+        materialized: bool = False,
     ) -> exp.Schema:
         """
         Build a schema expression for a table, columns, column comments, and additional schema properties.
@@ -809,6 +855,7 @@ class EngineAdapter:
                 target_columns_to_types=target_columns_to_types,
                 column_descriptions=column_descriptions,
                 is_view=is_view,
+                materialized=materialized,
             )
             + expressions,
         )
@@ -818,6 +865,7 @@ class EngineAdapter:
         target_columns_to_types: t.Dict[str, exp.DataType],
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
         is_view: bool = False,
+        materialized: bool = False,
     ) -> t.List[exp.ColumnDef]:
         engine_supports_schema_comments = (
             self.COMMENT_CREATION_VIEW.supports_schema_def
@@ -947,7 +995,7 @@ class EngineAdapter:
     def _create_table(
         self,
         table_name_or_schema: t.Union[exp.Schema, TableName],
-        expression: t.Optional[exp.Expression],
+        expression: t.Optional[exp.Expr],
         exists: bool = True,
         replace: bool = False,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
@@ -974,11 +1022,18 @@ class EngineAdapter:
             ),
             track_rows_processed=track_rows_processed,
         )
+        # Extract table name to clear cache
+        table_name = (
+            table_name_or_schema.this
+            if isinstance(table_name_or_schema, exp.Schema)
+            else table_name_or_schema
+        )
+        self._clear_data_object_cache(table_name)
 
     def _build_create_table_exp(
         self,
         table_name_or_schema: t.Union[exp.Schema, TableName],
-        expression: t.Optional[exp.Expression],
+        expression: t.Optional[exp.Expr],
         exists: bool = True,
         replace: bool = False,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
@@ -1029,13 +1084,15 @@ class EngineAdapter:
             target_table_name: The name of the table to create. Can be fully qualified or just table name.
             source_table_name: The name of the table to base the new table on.
         """
-        self.create_table(target_table_name, self.columns(source_table_name), exists=exists)
+        self._create_table_like(target_table_name, source_table_name, exists=exists, **kwargs)
+        self._clear_data_object_cache(target_table_name)
 
     def clone_table(
         self,
         target_table_name: TableName,
         source_table_name: TableName,
         replace: bool = False,
+        exists: bool = True,
         clone_kwargs: t.Optional[t.Dict[str, t.Any]] = None,
         **kwargs: t.Any,
     ) -> None:
@@ -1045,6 +1102,7 @@ class EngineAdapter:
             target_table_name: The name of the table that should be created.
             source_table_name: The name of the source table that should be cloned.
             replace: Whether or not to replace an existing table.
+            exists: Indicates whether to include the IF NOT EXISTS check.
         """
         if not self.SUPPORTS_CLONING:
             raise NotImplementedError(f"Engine does not support cloning: {type(self)}")
@@ -1055,6 +1113,7 @@ class EngineAdapter:
                 this=exp.to_table(target_table_name),
                 kind="TABLE",
                 replace=replace,
+                exists=exists,
                 clone=exp.Clone(
                     this=exp.to_table(source_table_name),
                     **(clone_kwargs or {}),
@@ -1062,6 +1121,7 @@ class EngineAdapter:
                 **kwargs,
             )
         )
+        self._clear_data_object_cache(target_table_name)
 
     def drop_data_object(self, data_object: DataObject, ignore_if_not_exists: bool = True) -> None:
         """Drops a data object of arbitrary type.
@@ -1127,6 +1187,7 @@ class EngineAdapter:
             drop_args["cascade"] = cascade
 
         self.execute(exp.Drop(this=exp.to_table(name), kind=kind, exists=exists, **drop_args))
+        self._clear_data_object_cache(name)
 
     def get_alter_operations(
         self,
@@ -1173,7 +1234,7 @@ class EngineAdapter:
         materialized_properties: t.Optional[t.Dict[str, t.Any]] = None,
         table_description: t.Optional[str] = None,
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
-        view_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        view_properties: t.Optional[t.Dict[str, exp.Expr]] = None,
         source_columns: t.Optional[t.List[str]] = None,
         **create_kwargs: t.Any,
     ) -> None:
@@ -1233,7 +1294,11 @@ class EngineAdapter:
         schema: t.Union[exp.Table, exp.Schema] = exp.to_table(view_name)
         if target_columns_to_types:
             schema = self._build_schema_exp(
-                exp.to_table(view_name), target_columns_to_types, column_descriptions, is_view=True
+                exp.to_table(view_name),
+                target_columns_to_types,
+                column_descriptions,
+                is_view=True,
+                materialized=materialized,
             )
 
         properties = create_kwargs.pop("properties", None)
@@ -1317,6 +1382,8 @@ class EngineAdapter:
                 quote_identifiers=self.QUOTE_IDENTIFIERS_IN_VIEWS,
             )
 
+        self._clear_data_object_cache(view_name)
+
         # Register table comment with commands if the engine doesn't support doing it in CREATE
         if (
             table_description
@@ -1346,7 +1413,7 @@ class EngineAdapter:
         schema_name: SchemaName,
         ignore_if_exists: bool = True,
         warn_on_error: bool = True,
-        properties: t.Optional[t.List[exp.Expression]] = None,
+        properties: t.Optional[t.List[exp.Expr]] = None,
     ) -> None:
         properties = properties or []
         return self._create_schema(
@@ -1362,7 +1429,7 @@ class EngineAdapter:
         schema_name: SchemaName,
         ignore_if_exists: bool,
         warn_on_error: bool,
-        properties: t.List[exp.Expression],
+        properties: t.List[exp.Expr],
         kind: str,
     ) -> None:
         """Create a schema from a name or qualified table name."""
@@ -1387,7 +1454,7 @@ class EngineAdapter:
         schema_name: SchemaName,
         ignore_if_not_exists: bool = True,
         cascade: bool = False,
-        **drop_args: t.Dict[str, exp.Expression],
+        **drop_args: t.Dict[str, exp.Expr],
     ) -> None:
         return self._drop_object(
             name=schema_name,
@@ -1446,13 +1513,19 @@ class EngineAdapter:
         }
 
     def table_exists(self, table_name: TableName) -> bool:
+        table = exp.to_table(table_name)
+        data_object_cache_key = _get_data_object_cache_key(table.catalog, table.db, table.name)
+        if data_object_cache_key in self._data_object_cache:
+            logger.debug("Table existence cache hit: %s", data_object_cache_key)
+            return self._data_object_cache[data_object_cache_key] is not None
+
         try:
-            self.execute(exp.Describe(this=exp.to_table(table_name), kind="TABLE"))
+            self.execute(exp.Describe(this=table, kind="TABLE"))
             return True
         except Exception:
             return False
 
-    def delete_from(self, table_name: TableName, where: t.Union[str, exp.Expression]) -> None:
+    def delete_from(self, table_name: TableName, where: t.Union[str, exp.Expr]) -> None:
         self.execute(exp.delete(table_name, where))
 
     def insert_append(
@@ -1510,7 +1583,7 @@ class EngineAdapter:
         self,
         table_name: TableName,
         query_or_df: QueryOrDF,
-        partitioned_by: t.List[exp.Expression],
+        partitioned_by: t.List[exp.Expr],
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         source_columns: t.Optional[t.List[str]] = None,
     ) -> None:
@@ -1541,10 +1614,8 @@ class EngineAdapter:
         query_or_df: QueryOrDF,
         start: TimeLike,
         end: TimeLike,
-        time_formatter: t.Callable[
-            [TimeLike, t.Optional[t.Dict[str, exp.DataType]]], exp.Expression
-        ],
-        time_column: TimeColumn | exp.Expression | str,
+        time_formatter: t.Callable[[TimeLike, t.Optional[t.Dict[str, exp.DataType]]], exp.Expr],
+        time_column: TimeColumn | exp.Expr | str,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         source_columns: t.Optional[t.List[str]] = None,
         **kwargs: t.Any,
@@ -1581,7 +1652,7 @@ class EngineAdapter:
         **kwargs: t.Any,
     ) -> None:
         return self._insert_overwrite_by_condition(
-            table_name, source_queries, target_columns_to_types, where
+            table_name, source_queries, target_columns_to_types, where, **kwargs
         )
 
     def _values_to_sql(
@@ -1633,6 +1704,30 @@ class EngineAdapter:
                             target_columns_to_types=target_columns_to_types,
                             order_projections=False,
                         )
+                    elif insert_overwrite_strategy.is_merge:
+                        columns = [exp.column(col) for col in target_columns_to_types]
+                        when_not_matched_by_source = exp.When(
+                            matched=False,
+                            source=True,
+                            condition=where,
+                            then=exp.Delete(),
+                        )
+                        when_not_matched_by_target = exp.When(
+                            matched=False,
+                            source=False,
+                            then=exp.Insert(
+                                this=exp.Tuple(expressions=columns),
+                                expression=exp.Tuple(expressions=columns),
+                            ),
+                        )
+                        self._merge(
+                            target_table=table_name,
+                            query=query,
+                            on=exp.false(),
+                            whens=exp.Whens(
+                                expressions=[when_not_matched_by_source, when_not_matched_by_target]
+                            ),
+                        )
                     else:
                         insert_exp = exp.insert(
                             query,
@@ -1660,7 +1755,7 @@ class EngineAdapter:
         self,
         target_table: TableName,
         query: Query,
-        on: exp.Expression,
+        on: exp.Expr,
         whens: exp.Whens,
     ) -> None:
         this = exp.alias_(exp.to_table(target_table), alias=MERGE_TARGET_ALIAS, table=True)
@@ -1675,7 +1770,7 @@ class EngineAdapter:
         self,
         target_table: TableName,
         source_table: QueryOrDF,
-        unique_key: t.Sequence[exp.Expression],
+        unique_key: t.Sequence[exp.Expr],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
         execution_time: t.Union[TimeLike, exp.Column],
@@ -1711,11 +1806,11 @@ class EngineAdapter:
         self,
         target_table: TableName,
         source_table: QueryOrDF,
-        unique_key: t.Sequence[exp.Expression],
+        unique_key: t.Sequence[exp.Expr],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
         execution_time: t.Union[TimeLike, exp.Column],
-        check_columns: t.Union[exp.Star, t.Sequence[exp.Column]],
+        check_columns: t.Union[exp.Star, t.Sequence[exp.Expr]],
         invalidate_hard_deletes: bool = True,
         execution_time_as_valid_from: bool = False,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
@@ -1747,13 +1842,13 @@ class EngineAdapter:
         self,
         target_table: TableName,
         source_table: QueryOrDF,
-        unique_key: t.Sequence[exp.Expression],
+        unique_key: t.Sequence[exp.Expr],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
         execution_time: t.Union[TimeLike, exp.Column],
         invalidate_hard_deletes: bool = True,
         updated_at_col: t.Optional[exp.Column] = None,
-        check_columns: t.Optional[t.Union[exp.Star, t.Sequence[exp.Column]]] = None,
+        check_columns: t.Optional[t.Union[exp.Star, t.Sequence[exp.Expr]]] = None,
         updated_at_as_valid_from: bool = False,
         execution_time_as_valid_from: bool = False,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
@@ -1828,8 +1923,10 @@ class EngineAdapter:
         # they are equal or not, the extra check is not a problem and we gain simplified logic here.
         # If we want to change this, then we just need to check the expressions in unique_key and pull out the
         # column names and then remove them from the unmanaged_columns
-        if check_columns and check_columns == exp.Star():
-            check_columns = [exp.column(col) for col in unmanaged_columns_to_types]
+        if check_columns:
+            # Handle both Star directly and [Star()] (which can happen during serialization/deserialization)
+            if isinstance(seq_get(ensure_list(check_columns), 0), exp.Star):
+                check_columns = [exp.column(col) for col in unmanaged_columns_to_types]
         execution_ts = (
             exp.cast(execution_time, time_data_type, dialect=self.dialect)
             if isinstance(execution_time, exp.Column)
@@ -1840,7 +1937,7 @@ class EngineAdapter:
                 raise SQLMeshError(
                     "Cannot use `updated_at_as_valid_from` without `updated_at_name` for SCD Type 2"
                 )
-            update_valid_from_start: t.Union[str, exp.Expression] = updated_at_col
+            update_valid_from_start: t.Union[str, exp.Expr] = updated_at_col
         # If using check_columns and the user doesn't always want execution_time for valid from
         # then we only use epoch 0 if we are truncating the table and loading rows for the first time.
         # All future new rows should have execution time.
@@ -1866,7 +1963,8 @@ class EngineAdapter:
                 col_qualified.set("table", exp.to_identifier("joined"))
 
                 t_col = col_qualified.copy()
-                t_col.this.set("this", f"t_{col.name}")
+                for column in t_col.find_all(exp.Column):
+                    column.this.set("this", f"t_{column.name}")
 
                 row_check_conditions.extend(
                     [
@@ -2138,9 +2236,9 @@ class EngineAdapter:
         target_table: TableName,
         source_table: QueryOrDF,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
-        unique_key: t.Sequence[exp.Expression],
+        unique_key: t.Sequence[exp.Expr],
         when_matched: t.Optional[exp.Whens] = None,
-        merge_filter: t.Optional[exp.Expression] = None,
+        merge_filter: t.Optional[exp.Expr] = None,
         source_columns: t.Optional[t.List[str]] = None,
         **kwargs: t.Any,
     ) -> None:
@@ -2217,24 +2315,34 @@ class EngineAdapter:
                     "Tried to rename table across catalogs which is not supported"
                 )
         self._rename_table(old_table_name, new_table_name)
+        self._clear_data_object_cache(old_table_name)
+        self._clear_data_object_cache(new_table_name)
 
-    def get_data_object(self, target_name: TableName) -> t.Optional[DataObject]:
+    def get_data_object(
+        self, target_name: TableName, safe_to_cache: bool = False
+    ) -> t.Optional[DataObject]:
         target_table = exp.to_table(target_name)
         existing_data_objects = self.get_data_objects(
-            schema_(target_table.db, target_table.catalog), {target_table.name}
+            schema_(target_table.db, target_table.catalog),
+            {target_table.name},
+            safe_to_cache=safe_to_cache,
         )
         if existing_data_objects:
             return existing_data_objects[0]
         return None
 
     def get_data_objects(
-        self, schema_name: SchemaName, object_names: t.Optional[t.Set[str]] = None
+        self,
+        schema_name: SchemaName,
+        object_names: t.Optional[t.Set[str]] = None,
+        safe_to_cache: bool = False,
     ) -> t.List[DataObject]:
         """Lists all data objects in the target schema.
 
         Args:
             schema_name: The name of the schema to list data objects from.
             object_names: If provided, only return data objects with these names.
+            safe_to_cache: Whether it is safe to cache the results of this call.
 
         Returns:
             A list of data objects in the target schema.
@@ -2242,19 +2350,68 @@ class EngineAdapter:
         if object_names is not None:
             if not object_names:
                 return []
-            object_names_list = list(object_names)
-            batches = [
-                object_names_list[i : i + self.DATA_OBJECT_FILTER_BATCH_SIZE]
-                for i in range(0, len(object_names_list), self.DATA_OBJECT_FILTER_BATCH_SIZE)
-            ]
-            return [
-                obj for batch in batches for obj in self._get_data_objects(schema_name, set(batch))
-            ]
-        return self._get_data_objects(schema_name)
+
+            # Check cache for each object name
+            target_schema = to_schema(schema_name)
+            cached_objects = []
+            missing_names = set()
+
+            for name in object_names:
+                cache_key = _get_data_object_cache_key(
+                    target_schema.catalog, target_schema.db, name
+                )
+                if cache_key in self._data_object_cache:
+                    logger.debug("Data object cache hit: %s", cache_key)
+                    data_object = self._data_object_cache[cache_key]
+                    # If the object is none, then the table was previously looked for but not found
+                    if data_object:
+                        cached_objects.append(data_object)
+                else:
+                    logger.debug("Data object cache miss: %s", cache_key)
+                    missing_names.add(name)
+
+            # Fetch missing objects from database
+            if missing_names:
+                object_names_list = list(missing_names)
+                batches = [
+                    object_names_list[i : i + self.DATA_OBJECT_FILTER_BATCH_SIZE]
+                    for i in range(0, len(object_names_list), self.DATA_OBJECT_FILTER_BATCH_SIZE)
+                ]
+
+                fetched_objects = []
+                fetched_object_names = set()
+                for batch in batches:
+                    objects = self._get_data_objects(schema_name, set(batch))
+                    for obj in objects:
+                        if safe_to_cache:
+                            cache_key = _get_data_object_cache_key(
+                                obj.catalog, obj.schema_name, obj.name
+                            )
+                            self._data_object_cache[cache_key] = obj
+                        fetched_objects.append(obj)
+                        fetched_object_names.add(obj.name)
+
+                if safe_to_cache:
+                    for missing_name in missing_names - fetched_object_names:
+                        cache_key = _get_data_object_cache_key(
+                            target_schema.catalog, target_schema.db, missing_name
+                        )
+                        self._data_object_cache[cache_key] = None
+
+                return cached_objects + fetched_objects
+
+            return cached_objects
+
+        fetched_objects = self._get_data_objects(schema_name)
+        if safe_to_cache:
+            for obj in fetched_objects:
+                cache_key = _get_data_object_cache_key(obj.catalog, obj.schema_name, obj.name)
+                self._data_object_cache[cache_key] = obj
+        return fetched_objects
 
     def fetchone(
         self,
-        query: t.Union[exp.Expression, str],
+        query: t.Union[exp.Expr, str],
         ignore_unsupported_errors: bool = False,
         quote_identifiers: bool = False,
     ) -> t.Optional[t.Tuple]:
@@ -2268,7 +2425,7 @@ class EngineAdapter:
 
     def fetchall(
         self,
-        query: t.Union[exp.Expression, str],
+        query: t.Union[exp.Expr, str],
         ignore_unsupported_errors: bool = False,
         quote_identifiers: bool = False,
     ) -> t.List[t.Tuple]:
@@ -2281,7 +2438,7 @@ class EngineAdapter:
             return self.cursor.fetchall()
 
     def _fetch_native_df(
-        self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
+        self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
     ) -> DF:
         """Fetches a DataFrame that can be either Pandas or PySpark from the cursor"""
         with self.transaction():
@@ -2304,7 +2461,7 @@ class EngineAdapter:
         raise NotImplementedError(f"Unable to convert {type(query_or_df)} to Pandas")
 
     def fetchdf(
-        self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
+        self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
     ) -> pd.DataFrame:
         """Fetches a Pandas DataFrame from the cursor"""
         import pandas as pd
@@ -2317,10 +2474,15 @@ class EngineAdapter:
         return df
 
     def fetch_pyspark_df(
-        self, query: t.Union[exp.Expression, str], quote_identifiers: bool = False
+        self, query: t.Union[exp.Expr, str], quote_identifiers: bool = False
     ) -> PySparkDataFrame:
         """Fetches a PySpark DataFrame from the cursor"""
         raise NotImplementedError(f"Engine does not support PySpark DataFrames: {type(self)}")
+
+    @property
+    def wap_enabled(self) -> bool:
+        """Returns whether WAP is enabled for this engine."""
+        return self._extra_config.get("wap_enabled", False)
 
     def wap_supported(self, table_name: TableName) -> bool:
         """Returns whether WAP for the target table is supported."""
@@ -2358,6 +2520,33 @@ class EngineAdapter:
             wap_id: The WAP ID to publish.
         """
         raise NotImplementedError(f"Engine does not support WAP: {type(self)}")
+
+    def sync_grants_config(
+        self,
+        table: exp.Table,
+        grants_config: GrantsConfig,
+        table_type: DataObjectType = DataObjectType.TABLE,
+    ) -> None:
+        """Applies the grants_config to a table authoritatively.
+        It first compares the specified grants against the current grants, and then
+        applies the diffs to the table by revoking and granting privileges as needed.
+
+        Args:
+            table: The table/view to apply grants to.
+            grants_config: Dictionary mapping privileges to lists of grantees.
+            table_type: The type of database object (TABLE, VIEW, MATERIALIZED_VIEW).
+        """
+        if not self.SUPPORTS_GRANTS:
+            raise NotImplementedError(f"Engine does not support grants: {type(self)}")
+
+        current_grants = self._get_current_grants_config(table)
+        new_grants, revoked_grants = self._diff_grants_configs(grants_config, current_grants)
+        revoke_exprs = self._revoke_grants_config_expr(table, revoked_grants, table_type)
+        grant_exprs = self._apply_grants_config_expr(table, new_grants, table_type)
+        dcl_exprs = revoke_exprs + grant_exprs
+
+        if dcl_exprs:
+            self.execute(dcl_exprs)
 
     @contextlib.contextmanager
     def transaction(
@@ -2415,7 +2604,7 @@ class EngineAdapter:
 
     def execute(
         self,
-        expressions: t.Union[str, exp.Expression, t.Sequence[exp.Expression]],
+        expressions: t.Union[str, exp.Expr, t.Sequence[exp.Expr]],
         ignore_unsupported_errors: bool = False,
         quote_identifiers: bool = True,
         track_rows_processed: bool = False,
@@ -2427,7 +2616,7 @@ class EngineAdapter:
         )
         with self.transaction():
             for e in ensure_list(expressions):
-                if isinstance(e, exp.Expression):
+                if isinstance(e, exp.Expr):
                     self._check_identifier_length(e)
                     sql = self._to_sql(e, quote=quote_identifiers, **to_sql_kwargs)
                 else:
@@ -2437,7 +2626,7 @@ class EngineAdapter:
 
                 self._log_sql(
                     sql,
-                    expression=e if isinstance(e, exp.Expression) else None,
+                    expression=e if isinstance(e, exp.Expr) else None,
                     quote_identifiers=quote_identifiers,
                 )
                 self._execute(sql, track_rows_processed, **kwargs)
@@ -2450,7 +2639,7 @@ class EngineAdapter:
     def _log_sql(
         self,
         sql: str,
-        expression: t.Optional[exp.Expression] = None,
+        expression: t.Optional[exp.Expr] = None,
         quote_identifiers: bool = True,
     ) -> None:
         if not logger.isEnabledFor(self._execute_log_level):
@@ -2542,7 +2731,7 @@ class EngineAdapter:
                 self.drop_table(table)
 
     def _table_or_view_properties_to_expressions(
-        self, table_or_view_properties: t.Optional[t.Dict[str, exp.Expression]] = None
+        self, table_or_view_properties: t.Optional[t.Dict[str, exp.Expr]] = None
     ) -> t.List[exp.Property]:
         """Converts model properties (either physical or virtual) to a list of property expressions."""
         if not table_or_view_properties:
@@ -2554,7 +2743,7 @@ class EngineAdapter:
 
     def _build_partitioned_by_exp(
         self,
-        partitioned_by: t.List[exp.Expression],
+        partitioned_by: t.List[exp.Expr],
         *,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
@@ -2565,27 +2754,56 @@ class EngineAdapter:
 
     def _build_clustered_by_exp(
         self,
-        clustered_by: t.List[exp.Expression],
+        clustered_by: t.List[exp.Expr],
         **kwargs: t.Any,
     ) -> t.Optional[exp.Cluster]:
         return None
+
+    def adjust_physical_properties_for_incremental(
+        self,
+        physical_properties: t.Dict[str, t.Any],
+        *,
+        requires_delete_capable_table: bool,
+        unique_key: t.Optional[t.List[exp.Expr]],
+        model_name: str,
+    ) -> t.Dict[str, t.Any]:
+        """Adjusts physical properties for an incremental model before the table is created.
+
+        Some engines require a specific physical table layout before they can run the DELETE/MERGE
+        statements that incremental model kinds rely on (e.g. StarRocks only supports those on
+        PRIMARY KEY tables). This hook lets each engine derive or validate the required properties
+        while keeping the generic evaluator free of engine-specific branching.
+
+        Args:
+            physical_properties: The model's physical properties.
+            requires_delete_capable_table: Whether the model kind issues DELETE/MERGE statements
+                (as opposed to append-only INSERTs), as determined by the generic evaluator.
+            unique_key: The model's unique key, populated only when the kind allows promoting it to
+                an engine-specific key (i.e. INCREMENTAL_BY_UNIQUE_KEY); otherwise None.
+            model_name: The model name, for use in diagnostics.
+
+        Returns:
+            The (possibly adjusted) physical properties. Implementations own the given mapping and
+            may mutate it in place; the base implementation returns it unchanged.
+        """
+        return physical_properties
 
     def _build_table_properties_exp(
         self,
         catalog_name: t.Optional[str] = None,
         table_format: t.Optional[str] = None,
         storage_format: t.Optional[str] = None,
-        partitioned_by: t.Optional[t.List[exp.Expression]] = None,
+        partitioned_by: t.Optional[t.List[exp.Expr]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
-        clustered_by: t.Optional[t.List[exp.Expression]] = None,
-        table_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        clustered_by: t.Optional[t.List[exp.Expr]] = None,
+        table_properties: t.Optional[t.Dict[str, exp.Expr]] = None,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
         table_kind: t.Optional[str] = None,
         **kwargs: t.Any,
     ) -> t.Optional[exp.Properties]:
         """Creates a SQLGlot table properties expression for ddl."""
-        properties: t.List[exp.Expression] = []
+        properties: t.List[exp.Expr] = []
 
         if table_description:
             properties.append(
@@ -2604,12 +2822,12 @@ class EngineAdapter:
 
     def _build_view_properties_exp(
         self,
-        view_properties: t.Optional[t.Dict[str, exp.Expression]] = None,
+        view_properties: t.Optional[t.Dict[str, exp.Expr]] = None,
         table_description: t.Optional[str] = None,
         **kwargs: t.Any,
     ) -> t.Optional[exp.Properties]:
         """Creates a SQLGlot table properties expression for view"""
-        properties: t.List[exp.Expression] = []
+        properties: t.List[exp.Expr] = []
 
         if table_description:
             properties.append(
@@ -2631,7 +2849,7 @@ class EngineAdapter:
     def _truncate_column_comment(self, comment: str) -> str:
         return self._truncate_comment(comment, self.MAX_COLUMN_COMMENT_LENGTH)
 
-    def _to_sql(self, expression: exp.Expression, quote: bool = True, **kwargs: t.Any) -> str:
+    def _to_sql(self, expression: exp.Expr, quote: bool = True, **kwargs: t.Any) -> str:
         """
         Converts an expression to a SQL string. Has a set of default kwargs to apply, and then default
         kwargs defined for the given dialect, and then kwargs provided by the user when defining the engine
@@ -2651,6 +2869,17 @@ class EngineAdapter:
             quote_identifiers(expression)
 
         return expression.sql(**sql_gen_kwargs, copy=False)  # type: ignore
+
+    def _clear_data_object_cache(self, table_name: t.Optional[TableName] = None) -> None:
+        """Clears the cache entry for the given table name, or clears the entire cache if table_name is None."""
+        if table_name is None:
+            logger.debug("Clearing entire data object cache")
+            self._data_object_cache.clear()
+        else:
+            table = exp.to_table(table_name)
+            cache_key = _get_data_object_cache_key(table.catalog, table.db, table.name)
+            logger.debug("Clearing data object cache key: %s", cache_key)
+            self._data_object_cache.pop(cache_key, None)
 
     def _get_data_objects(
         self, schema_name: SchemaName, object_names: t.Optional[t.Set[str]] = None
@@ -2681,7 +2910,7 @@ class EngineAdapter:
         self,
         query: Query,
         target_columns_to_types: t.Dict[str, exp.DataType],
-        where: t.Optional[exp.Expression] = None,
+        where: t.Optional[exp.Expr] = None,
         coerce_types: bool = False,
     ) -> Query:
         if not isinstance(query, exp.Query) or (
@@ -2690,9 +2919,9 @@ class EngineAdapter:
             return query
 
         query = t.cast(exp.Query, query.copy())
-        with_ = query.args.pop("with", None)
+        with_ = query.args.pop("with_", None)
 
-        select_exprs: t.List[exp.Expression] = [
+        select_exprs: t.List[exp.Expr] = [
             exp.column(c, quoted=True) for c in target_columns_to_types
         ]
         if coerce_types and columns_to_types_all_known(target_columns_to_types):
@@ -2706,7 +2935,7 @@ class EngineAdapter:
             query = query.where(where, copy=False)
 
         if with_:
-            query.set("with", with_)
+            query.set("with_", with_)
 
         return query
 
@@ -2743,7 +2972,7 @@ class EngineAdapter:
         target_table: TableName,
         source_table: QueryOrDF,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]],
-        key: t.Sequence[exp.Expression],
+        key: t.Sequence[exp.Expr],
         is_unique_key: bool,
         source_columns: t.Optional[t.List[str]] = None,
     ) -> None:
@@ -2751,7 +2980,11 @@ class EngineAdapter:
             target_columns_to_types = self.columns(target_table)
 
         temp_table = self._get_temp_table(target_table)
-        key_exp = exp.func("CONCAT_WS", "'__SQLMESH_DELIM__'", *key) if len(key) > 1 else key[0]
+        key_exp = (
+            exp.func("CONCAT_WS", "'__SQLMESH_DELIM__'", *key, dialect=self.dialect)
+            if len(key) > 1
+            else key[0]
+        )
         column_names = list(target_columns_to_types or [])
 
         with self.transaction():
@@ -2837,6 +3070,15 @@ class EngineAdapter:
                     exc_info=True,
                 )
 
+    def _create_table_like(
+        self,
+        target_table_name: TableName,
+        source_table_name: TableName,
+        exists: bool,
+        **kwargs: t.Any,
+    ) -> None:
+        self.create_table(target_table_name, self.columns(source_table_name), exists=exists)
+
     def _rename_table(
         self,
         old_table_name: TableName,
@@ -2875,7 +3117,7 @@ class EngineAdapter:
             )
         )
 
-    def _check_identifier_length(self, expression: exp.Expression) -> None:
+    def _check_identifier_length(self, expression: exp.Expr) -> None:
         if self.MAX_IDENTIFIER_LENGTH is None or not isinstance(expression, exp.DDL):
             return
 
@@ -2887,6 +3129,127 @@ class EngineAdapter:
                     f"Identifier name '{name}' (length {name_length}) exceeds {self.dialect.capitalize()}'s max identifier limit of {self.MAX_IDENTIFIER_LENGTH} characters"
                 )
 
+    def get_table_last_modified_ts(self, table_names: t.List[TableName]) -> t.List[int]:
+        raise NotImplementedError()
+
+    @classmethod
+    def _diff_grants_configs(
+        cls, new_config: GrantsConfig, old_config: GrantsConfig
+    ) -> t.Tuple[GrantsConfig, GrantsConfig]:
+        """Compute additions and removals between two grants configurations.
+
+        This method compares new (desired) and old (current) GrantsConfigs case-insensitively
+        for both privilege keys and grantees, while preserving original casing
+        in the output GrantsConfigs.
+
+        Args:
+            new_config: Desired grants configuration (specified by the user).
+            old_config: Current grants configuration (returned by the database).
+
+        Returns:
+            A tuple of (additions, removals) GrantsConfig where:
+            - additions contains privileges/grantees present in new_config but not in old_config
+            - additions uses keys and grantee strings from new_config (user-specified casing)
+            - removals contains privileges/grantees present in old_config but not in new_config
+            - removals uses keys and grantee strings from old_config (database-returned casing)
+
+        Notes:
+            - Comparison is case-insensitive using casefold(); original casing is preserved in results.
+            - Overlapping grantees (case-insensitive) are excluded from the results.
+        """
+
+        def _diffs(config1: GrantsConfig, config2: GrantsConfig) -> GrantsConfig:
+            diffs: GrantsConfig = {}
+            cf_config2 = {k.casefold(): {g.casefold() for g in v} for k, v in config2.items()}
+            for key, grantees in config1.items():
+                cf_key = key.casefold()
+
+                # Missing key (add all grantees)
+                if cf_key not in cf_config2:
+                    diffs[key] = grantees.copy()
+                    continue
+
+                # Include only grantees not in config2
+                cf_grantees2 = cf_config2[cf_key]
+                diff_grantees = []
+                for grantee in grantees:
+                    if grantee.casefold() not in cf_grantees2:
+                        diff_grantees.append(grantee)
+                if diff_grantees:
+                    diffs[key] = diff_grantees
+            return diffs
+
+        return _diffs(new_config, old_config), _diffs(old_config, new_config)
+
+    def _get_current_grants_config(self, table: exp.Table) -> GrantsConfig:
+        """Returns current grants for a table as a dictionary.
+
+        This method queries the database and returns the current grants/permissions
+        for the given table, parsed into a dictionary format. The it handles
+        case-insensitive comparison between these current grants and the desired
+        grants from model configuration.
+
+        Args:
+            table: The table/view to query grants for.
+
+        Returns:
+            Dictionary mapping permissions to lists of grantees. Permission names
+            should be returned as the database provides them (typically uppercase
+            for standard SQL permissions, but engine-specific roles may vary).
+
+        Raises:
+            NotImplementedError: If the engine does not support grants.
+        """
+        if not self.SUPPORTS_GRANTS:
+            raise NotImplementedError(f"Engine does not support grants: {type(self)}")
+        raise NotImplementedError("Subclass must implement get_current_grants")
+
+    def _apply_grants_config_expr(
+        self,
+        table: exp.Table,
+        grants_config: GrantsConfig,
+        table_type: DataObjectType = DataObjectType.TABLE,
+    ) -> t.List[exp.Expr]:
+        """Returns SQLGlot Grant expressions to apply grants to a table.
+
+        Args:
+            table: The table/view to grant permissions on.
+            grants_config: Dictionary mapping permissions to lists of grantees.
+            table_type: The type of database object (TABLE, VIEW, MATERIALIZED_VIEW).
+
+        Returns:
+            List of SQLGlot expressions for grant operations.
+
+        Raises:
+            NotImplementedError: If the engine does not support grants.
+        """
+        if not self.SUPPORTS_GRANTS:
+            raise NotImplementedError(f"Engine does not support grants: {type(self)}")
+        raise NotImplementedError("Subclass must implement _apply_grants_config_expr")
+
+    def _revoke_grants_config_expr(
+        self,
+        table: exp.Table,
+        grants_config: GrantsConfig,
+        table_type: DataObjectType = DataObjectType.TABLE,
+    ) -> t.List[exp.Expr]:
+        """Returns SQLGlot expressions to revoke grants from a table.
+
+        Args:
+            table: The table/view to revoke permissions from.
+            grants_config: Dictionary mapping permissions to lists of grantees.
+            table_type: The type of database object (TABLE, VIEW, MATERIALIZED_VIEW).
+
+        Returns:
+            List of SQLGlot expressions for revoke operations.
+
+        Raises:
+            NotImplementedError: If the engine does not support grants.
+        """
+        if not self.SUPPORTS_GRANTS:
+            raise NotImplementedError(f"Engine does not support grants: {type(self)}")
+        raise NotImplementedError("Subclass must implement _revoke_grants_config_expr")
+
 
 class EngineAdapterWithIndexSupport(EngineAdapter):
     SUPPORTS_INDEXES = True
@@ -2896,3 +3259,9 @@ def _decoded_str(value: t.Union[str, bytes]) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return value
+
+
+def _get_data_object_cache_key(catalog: t.Optional[str], schema_name: str, object_name: str) -> str:
+    """Returns a cache key for a data object based on its fully qualified name."""
+    catalog = f"{catalog}." if catalog else ""
+    return f"{catalog}{schema_name}.{object_name}"

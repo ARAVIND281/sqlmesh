@@ -8,7 +8,7 @@ from pathlib import Path
 
 SQLMESH = "sqlmesh"
 SQLMESH_MANAGED = "sqlmesh_managed"
-SQLMESH_PATH = Path.home() / ".sqlmesh"
+SQLMESH_PATH = Path(os.getenv("SQLMESH_HOME") or Path.home() / ".sqlmesh")
 
 PROD = "prod"
 """Prod"""
@@ -96,3 +96,5 @@ NATIVE = "native"
 HYBRID = "hybrid"
 
 DISABLE_SQLMESH_STATE_MIGRATION = "SQLMESH__AIRFLOW__DISABLE_STATE_MIGRATION"
+
+LIQUID_CLUSTERING_KEYWORDS: frozenset = frozenset({"AUTO", "NONE"})

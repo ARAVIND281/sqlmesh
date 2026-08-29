@@ -39,7 +39,7 @@ def test_adapter_relation(sushi_test_project: Project, runtime_renderer: t.Calla
         table_name="foo.another", target_columns_to_types={"col": exp.DataType.build("int")}
     )
     engine_adapter.create_view(
-        view_name="foo.bar_view", query_or_df=parse_one("select * from foo.bar")
+        view_name="foo.bar_view", query_or_df=t.cast(exp.Query, parse_one("select * from foo.bar"))
     )
     engine_adapter.create_table(
         table_name="ignored.ignore", target_columns_to_types={"col": exp.DataType.build("int")}
@@ -242,6 +242,35 @@ def test_adapter_dispatch(sushi_test_project: Project, runtime_renderer: t.Calla
     assert renderer("{{ adapter.dispatch('current_engine', 'customers')() }}") == "duckdb"
     assert renderer("{{ adapter.dispatch('current_timestamp')() }}") == "now()"
     assert renderer("{{ adapter.dispatch('current_timestamp', 'dbt')() }}") == "now()"
+    assert renderer("{{ adapter.dispatch('select_distinct', 'customers')() }}") == "distinct"
+
+    # test with keyword arguments
+    assert (
+        renderer(
+            "{{ adapter.dispatch(macro_name='current_engine', macro_namespace='customers')() }}"
+        )
+        == "duckdb"
+    )
+    assert renderer("{{ adapter.dispatch(macro_name='current_timestamp')() }}") == "now()"
+    assert (
+        renderer("{{ adapter.dispatch(macro_name='current_timestamp', macro_namespace='dbt')() }}")
+        == "now()"
+    )
+
+    # mixing positional and keyword arguments
+    assert (
+        renderer("{{ adapter.dispatch('current_engine', macro_namespace='customers')() }}")
+        == "duckdb"
+    )
+    assert (
+        renderer("{{ adapter.dispatch('current_timestamp', macro_namespace=None)() }}") == "now()"
+    )
+    assert (
+        renderer("{{ adapter.dispatch('current_timestamp', macro_namespace='dbt')() }}") == "now()"
+    )
+
+    with pytest.raises(ConfigError, match=r"Macro 'current_engine'.*was not found."):
+        renderer("{{ adapter.dispatch(macro_name='current_engine')() }}")
 
     with pytest.raises(ConfigError, match=r"Macro 'current_engine'.*was not found."):
         renderer("{{ adapter.dispatch('current_engine')() }}")

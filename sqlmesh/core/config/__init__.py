@@ -22,6 +22,7 @@ from sqlmesh.core.config.connection import (
     RedshiftConnectionConfig as RedshiftConnectionConfig,
     SnowflakeConnectionConfig as SnowflakeConnectionConfig,
     SparkConnectionConfig as SparkConnectionConfig,
+    StarRocksConnectionConfig as StarRocksConnectionConfig,
     TrinoConnectionConfig as TrinoConnectionConfig,
     parse_connection_config as parse_connection_config,
 )
@@ -36,6 +37,6 @@ from sqlmesh.core.config.model import ModelDefaultsConfig as ModelDefaultsConfig
 from sqlmesh.core.config.naming import NameInferenceConfig as NameInferenceConfig
 from sqlmesh.core.config.linter import LinterConfig as LinterConfig
 from sqlmesh.core.config.plan import PlanConfig as PlanConfig
-from sqlmesh.core.config.root import Config as Config
+from sqlmesh.core.config.root import Config as Config, DbtConfig as DbtConfig
 from sqlmesh.core.config.run import RunConfig as RunConfig
 from sqlmesh.core.config.scheduler import BuiltInSchedulerConfig as BuiltInSchedulerConfig

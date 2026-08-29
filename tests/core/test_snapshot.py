@@ -168,6 +168,7 @@ def test_json(snapshot: Snapshot):
             "enabled": True,
             "extract_dependencies_from_query": True,
             "virtual_environment_mode": "full",
+            "grants_target_layer": "virtual",
         },
         "name": '"name"',
         "parents": [{"name": '"parent"."tbl"', "identifier": snapshot.parents[0].identifier}],
@@ -179,6 +180,36 @@ def test_json(snapshot: Snapshot):
         "unrestorable": False,
         "forward_only": False,
     }
+
+
+def test_json_with_grants(make_snapshot: t.Callable):
+    from sqlmesh.core.model.meta import GrantsTargetLayer
+
+    model = SqlModel(
+        name="name",
+        kind=dict(time_column="ds", batch_size=30, name=ModelKindName.INCREMENTAL_BY_TIME_RANGE),
+        owner="owner",
+        dialect="spark",
+        cron="1 0 * * *",
+        start="2020-01-01",
+        query=parse_one("SELECT @EACH([1, 2], x -> x), ds FROM parent.tbl"),
+        grants={"SELECT": ["role1", "role2"], "INSERT": ["role3"]},
+        grants_target_layer=GrantsTargetLayer.VIRTUAL,
+    )
+    snapshot = make_snapshot(model)
+
+    json_str = snapshot.json()
+    json_data = json.loads(json_str)
+    assert (
+        json_data["node"]["grants"]
+        == "('SELECT' = ARRAY('role1', 'role2'), 'INSERT' = ARRAY('role3'))"
+    )
+    assert json_data["node"]["grants_target_layer"] == "virtual"
+
+    reparsed_snapshot = Snapshot.model_validate_json(json_str)
+    assert isinstance(reparsed_snapshot.node, SqlModel)
+    assert reparsed_snapshot.node.grants == {"SELECT": ["role1", "role2"], "INSERT": ["role3"]}
+    assert reparsed_snapshot.node.grants_target_layer == GrantsTargetLayer.VIRTUAL
 
 
 def test_json_custom_materialization(make_snapshot: t.Callable):
@@ -954,7 +985,7 @@ def test_fingerprint(model: Model, parent_model: Model):
 
     original_fingerprint = SnapshotFingerprint(
         data_hash="2406542604",
-        metadata_hash="3341445192",
+        metadata_hash="1056339358",
     )
 
     assert fingerprint == original_fingerprint
@@ -1014,8 +1045,8 @@ def test_fingerprint_seed_model():
     )
 
     expected_fingerprint = SnapshotFingerprint(
-        data_hash="1586624913",
-        metadata_hash="2315134974",
+        data_hash="2112858704",
+        metadata_hash="2674364560",
     )
 
     model = load_sql_based_model(expressions, path=Path("./examples/sushi/models/test_model.sql"))
@@ -1054,7 +1085,7 @@ def test_fingerprint_jinja_macros(model: Model):
     )
     original_fingerprint = SnapshotFingerprint(
         data_hash="93332825",
-        metadata_hash="3341445192",
+        metadata_hash="1056339358",
     )
 
     fingerprint = fingerprint_from_node(model, nodes={})
@@ -1129,6 +1160,40 @@ def test_fingerprint_virtual_properties(model: Model, parent_model: Model):
     assert updated_fingerprint != fingerprint
     assert updated_fingerprint.metadata_hash != fingerprint.metadata_hash
     assert updated_fingerprint.data_hash == fingerprint.data_hash
+
+
+def test_fingerprint_grants(model: Model, parent_model: Model):
+    from sqlmesh.core.model.meta import GrantsTargetLayer
+
+    original_model = deepcopy(model)
+    fingerprint = fingerprint_from_node(model, nodes={})
+
+    updated_model = SqlModel(
+        **original_model.dict(),
+        grants={"SELECT": ["role1", "role2"]},
+    )
+    updated_fingerprint = fingerprint_from_node(updated_model, nodes={})
+
+    assert updated_fingerprint != fingerprint
+    assert updated_fingerprint.metadata_hash != fingerprint.metadata_hash
+    assert updated_fingerprint.data_hash == fingerprint.data_hash
+
+    different_grants_model = SqlModel(
+        **original_model.dict(),
+        grants={"SELECT": ["role3"], "INSERT": ["role4"]},
+    )
+    different_grants_fingerprint = fingerprint_from_node(different_grants_model, nodes={})
+
+    assert different_grants_fingerprint.metadata_hash != updated_fingerprint.metadata_hash
+    assert different_grants_fingerprint.metadata_hash != fingerprint.metadata_hash
+
+    target_layer_model = SqlModel(
+        **{**original_model.dict(), "grants_target_layer": GrantsTargetLayer.PHYSICAL},
+        grants={"SELECT": ["role1", "role2"]},
+    )
+    target_layer_fingerprint = fingerprint_from_node(target_layer_model, nodes={})
+
+    assert target_layer_fingerprint.metadata_hash != updated_fingerprint.metadata_hash
 
 
 def test_tableinfo_equality():
@@ -1565,6 +1630,276 @@ def test_categorize_change_sql(make_snapshot):
             config=config,
         )
         is SnapshotChangeCategory.NON_BREAKING
+    )
+
+
+def test_categorize_change_sql_additive_projection_edge_cases(make_snapshot):
+    config = CategorizerConfig(sql=AutoCategorizationMode.SEMI)
+
+    old_snapshot = make_snapshot(
+        SqlModel(name="a", query=parse_one("SELECT a::DATE, s::TEXT FROM t"))
+    )
+
+    # A same-type cast column has been inserted mid-list, above the existing one.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::DATE, x::TEXT, s::TEXT FROM t"))
+            ),
+            old=old_snapshot,
+            config=config,
+        )
+        == SnapshotChangeCategory.NON_BREAKING
+    )
+
+    # An added projection identical to an existing projection remains non-breaking.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT s::TEXT, a::DATE, s::TEXT FROM t"))
+            ),
+            old=old_snapshot,
+            config=config,
+        )
+        == SnapshotChangeCategory.NON_BREAKING
+    )
+
+    # Multiple same-type cast columns have been inserted mid-list.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(
+                    name="a", query=parse_one("SELECT a::DATE, x::TEXT, s::TEXT, y::INT FROM t")
+                )
+            ),
+            old=old_snapshot,
+            config=config,
+        )
+        == SnapshotChangeCategory.NON_BREAKING
+    )
+
+    # The type of an existing projection has changed (in addition to a new column): undetermined.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::INT, x::TEXT, s::TEXT FROM t"))
+            ),
+            old=old_snapshot,
+            config=config,
+        )
+        is None
+    )
+
+    # Existing projections have been reordered: undetermined.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT s::TEXT, a::DATE FROM t"))
+            ),
+            old=old_snapshot,
+            config=config,
+        )
+        is None
+    )
+
+    # An existing projection has been removed: undetermined.
+    assert (
+        categorize_change(
+            new=make_snapshot(SqlModel(name="a", query=parse_one("SELECT s::TEXT FROM t"))),
+            old=old_snapshot,
+            config=config,
+        )
+        is None
+    )
+
+    # A WHERE clause changed alongside the added cast column: undetermined.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(
+                    name="a",
+                    query=parse_one("SELECT a::DATE, x::TEXT, s::TEXT FROM t WHERE a = 2"),
+                )
+            ),
+            old=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::DATE, s::TEXT FROM t WHERE a = 1"))
+            ),
+            config=config,
+        )
+        is None
+    )
+
+    # Mid-list insert with ORDER BY ordinal shifts the referenced projection: undetermined.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(
+                    name="a",
+                    query=parse_one("SELECT a::DATE, x::TEXT, s::TEXT FROM t ORDER BY 2"),
+                )
+            ),
+            old=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::DATE, s::TEXT FROM t ORDER BY 2"))
+            ),
+            config=config,
+        )
+        is None
+    )
+
+    # Append at end with ORDER BY ordinal leaves existing ordinal bindings unchanged.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(
+                    name="a",
+                    query=parse_one("SELECT a::DATE, s::TEXT, x::TEXT FROM t ORDER BY 2"),
+                )
+            ),
+            old=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::DATE, s::TEXT FROM t ORDER BY 2"))
+            ),
+            config=config,
+        )
+        == SnapshotChangeCategory.NON_BREAKING
+    )
+
+    # Mid-list insert with GROUP BY ordinal shifts the referenced projection: undetermined.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(
+                    name="a",
+                    query=parse_one("SELECT a::DATE, x::TEXT, s::TEXT FROM t GROUP BY 2"),
+                )
+            ),
+            old=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::DATE, s::TEXT FROM t GROUP BY 2"))
+            ),
+            config=config,
+        )
+        is None
+    )
+
+    # Aliased UDTF projection: undetermined.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(
+                    name="a",
+                    query=parse_one(
+                        "SELECT a::DATE AS a, x::TEXT AS x, EXPLODE(y) AS y, s::TEXT AS s FROM t"
+                    ),
+                )
+            ),
+            old=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::DATE AS a, s::TEXT AS s FROM t"))
+            ),
+            config=config,
+        )
+        is None
+    )
+
+    # UDTF inside aliased scalar subquery remains non-breaking.
+    assert (
+        categorize_change(
+            new=make_snapshot(
+                SqlModel(
+                    name="a",
+                    query=parse_one(
+                        "SELECT a::DATE AS a, (SELECT x FROM unnest(b) x) AS sub, s::TEXT AS s FROM t"
+                    ),
+                )
+            ),
+            old=make_snapshot(
+                SqlModel(name="a", query=parse_one("SELECT a::DATE AS a, s::TEXT AS s FROM t"))
+            ),
+            config=config,
+        )
+        == SnapshotChangeCategory.NON_BREAKING
+    )
+
+
+@pytest.mark.parametrize(
+    ("previous_query", "this_query", "expected"),
+    [
+        pytest.param(
+            "WITH x AS (SELECT a FROM t) SELECT a FROM x",
+            "WITH x AS (SELECT a, b FROM t) SELECT a FROM x",
+            SnapshotChangeCategory.NON_BREAKING,
+            id="cte",
+        ),
+        pytest.param(
+            "SELECT a FROM t WHERE EXISTS (SELECT x FROM u)",
+            "SELECT a FROM t WHERE EXISTS (SELECT x, y FROM u)",
+            SnapshotChangeCategory.NON_BREAKING,
+            id="exists",
+        ),
+        pytest.param(
+            "SELECT (SELECT a FROM t) AS x",
+            "SELECT (SELECT a, b FROM t) AS x",
+            None,
+            id="scalar-subquery-projection",
+        ),
+        pytest.param(
+            "SELECT a FROM x UNION ALL SELECT a FROM y",
+            "SELECT a, b FROM x UNION ALL SELECT a, b FROM y",
+            SnapshotChangeCategory.NON_BREAKING,
+            id="union",
+        ),
+        pytest.param(
+            "WITH x AS (SELECT a::DATE, s::TEXT FROM t ORDER BY 2) SELECT * FROM x",
+            "WITH x AS (SELECT a::DATE, x::TEXT, s::TEXT FROM t ORDER BY 2) SELECT * FROM x",
+            None,
+            id="nested-order-by-ordinal",
+        ),
+        pytest.param(
+            "SELECT a FROM (SELECT x FROM t) AS nested",
+            "SELECT a FROM (SELECT x, EXPLODE(y) FROM t) AS nested",
+            None,
+            id="derived-table-udtf",
+        ),
+        pytest.param(
+            "SELECT a, c FROM t ORDER BY 2",
+            "SELECT a, b, c FROM t ORDER BY 2",
+            None,
+            id="order-by-ordinal",
+        ),
+        pytest.param(
+            "SELECT a, c FROM x UNION ALL SELECT a, c FROM y ORDER BY 2",
+            "SELECT a, b, c FROM x UNION ALL SELECT a, b, c FROM y ORDER BY 2",
+            None,
+            id="union-order-by-ordinal",
+        ),
+        pytest.param(
+            "SELECT a, c FROM x UNION ALL SELECT a, c FROM y UNION ALL SELECT a, c FROM z ORDER BY 2",
+            "SELECT a, b, c FROM x UNION ALL SELECT a, b, c FROM y UNION ALL SELECT a, b, c FROM z ORDER BY 2",
+            None,
+            id="nested-union-order-by-ordinal",
+        ),
+        pytest.param(
+            "SELECT a, c FROM x UNION ALL SELECT a, c FROM y ORDER BY 2",
+            "SELECT a, c, b FROM x UNION ALL SELECT a, c, b FROM y ORDER BY 2",
+            SnapshotChangeCategory.NON_BREAKING,
+            id="union-order-by-ordinal-append",
+        ),
+    ],
+)
+def test_categorize_change_sql_nested_projection_additions(
+    make_snapshot,
+    previous_query,
+    this_query,
+    expected,
+):
+    config = CategorizerConfig(sql=AutoCategorizationMode.SEMI)
+    old_snapshot = make_snapshot(SqlModel(name="a", query=parse_one(previous_query)))
+
+    assert (
+        categorize_change(
+            new=make_snapshot(SqlModel(name="a", query=parse_one(this_query))),
+            old=old_snapshot,
+            config=config,
+        )
+        is expected
     )
 
 
@@ -3567,3 +3902,28 @@ def test_snapshot_id_and_version_fingerprint_lazy_init():
 
     assert isinstance(snapshot.fingerprint_, SnapshotFingerprint)
     assert snapshot.fingerprint == fingerprint
+
+
+def test_snapshot_id_and_version_optional_kind_name():
+    snapshot = SnapshotIdAndVersion(
+        name="a",
+        identifier="1234",
+        version="2345",
+        dev_version=None,
+        fingerprint="",
+    )
+
+    assert snapshot.model_kind_name is None
+
+    snapshot = SnapshotIdAndVersion(
+        name="a",
+        identifier="1234",
+        version="2345",
+        kind_name="INCREMENTAL_UNMANAGED",
+        dev_version=None,
+        fingerprint="",
+    )
+
+    assert snapshot.model_kind_name
+    assert snapshot.is_incremental_unmanaged
+    assert snapshot.full_history_restatement_only

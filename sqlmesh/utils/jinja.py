@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import re
@@ -12,7 +13,8 @@ from traceback import walk_tb
 
 from jinja2 import Environment, Template, nodes, UndefinedError
 from jinja2.runtime import Macro
-from sqlglot import Dialect, Expression, Parser, TokenType
+from sqlglot import Dialect, Parser, TokenType
+from sqlglot.expressions import Expression
 
 from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
@@ -27,11 +29,40 @@ if t.TYPE_CHECKING:
 SQLMESH_JINJA_PACKAGE = "sqlmesh.utils.jinja"
 
 
+def b64decode(value: t.Union[str, bytes]) -> str:
+    """Decode a base64-encoded value and return it as UTF-8 text.
+
+    Intended for base64-encoded string/JSON secrets (for example a service-account
+    key stored in an environment variable), not arbitrary binary payloads.
+    """
+    decoded = value.encode("utf-8") if isinstance(value, str) else value
+    return base64.b64decode(decoded).decode("utf-8")
+
+
+def b64encode(value: t.Union[str, bytes]) -> str:
+    """Base64-encode a value and return the encoding as UTF-8 text.
+
+    The input is treated as UTF-8 text, mirroring ``b64decode``; it is intended for
+    string/JSON secrets rather than arbitrary binary payloads.
+    """
+    encoded = value.encode("utf-8") if isinstance(value, str) else value
+    return base64.b64encode(encoded).decode("utf-8")
+
+
+def create_builtin_filters() -> t.Dict[str, t.Callable]:
+    return {
+        "b64decode": b64decode,
+        "b64encode": b64encode,
+    }
+
+
 def environment(**kwargs: t.Any) -> Environment:
     extensions = kwargs.pop("extensions", [])
     extensions.append("jinja2.ext.do")
     extensions.append("jinja2.ext.loopcontrols")
-    return Environment(extensions=extensions, **kwargs)
+    env = Environment(extensions=extensions, **kwargs)
+    env.filters.update(create_builtin_filters())
+    return env
 
 
 ENVIRONMENT = environment()
@@ -78,6 +109,11 @@ class MacroExtractor(Parser):
         self.reset()
         self.sql = jinja
         self._tokens = Dialect.get_or_raise(dialect).tokenize(jinja)
+
+        # guard for older sqlglot versions (before 30.0.3)
+        if hasattr(self, "_tokens_size"):
+            # keep the cached length in sync
+            self._tokens_size = len(self._tokens)
         self._index = -1
         self._advance()
 
@@ -133,6 +169,12 @@ def find_call_names(node: nodes.Node, vars_in_scope: t.Set[str]) -> t.Iterator[C
     vars_in_scope = vars_in_scope.copy()
     for child_node in node.iter_child_nodes():
         if "target" in child_node.fields:
+            # For nodes with assignment targets (Assign, AssignBlock, For, Import),
+            # the target name could shadow a reference in the right hand side.
+            # So we need to process the RHS before adding the target to scope.
+            # For example: {% set model = model.path %} should track model.path.
+            yield from find_call_names(child_node, vars_in_scope)
+
             target = getattr(child_node, "target")
             if isinstance(target, nodes.Name):
                 vars_in_scope.add(target.name)
@@ -149,7 +191,9 @@ def find_call_names(node: nodes.Node, vars_in_scope: t.Set[str]) -> t.Iterator[C
             name = call_name(child_node)
             if name[0][0] != "'" and name[0] not in vars_in_scope:
                 yield (name, child_node)
-        yield from find_call_names(child_node, vars_in_scope)
+
+        if "target" not in child_node.fields:
+            yield from find_call_names(child_node, vars_in_scope)
 
 
 def extract_call_names(
@@ -204,6 +248,20 @@ def extract_macro_references_and_variables(
             elif len(call_name) == 2:
                 macro_references.add(MacroReference(package=call_name[0], name=call_name[1]))
     return macro_references, variables
+
+
+def sort_dict_recursive(
+    item: t.Dict[str, t.Any],
+) -> t.Dict[str, t.Any]:
+    sorted_dict: t.Dict[str, t.Any] = {}
+    for k, v in sorted(item.items()):
+        if isinstance(v, list):
+            sorted_dict[k] = sorted(v)
+        elif isinstance(v, dict):
+            sorted_dict[k] = sort_dict_recursive(v)
+        else:
+            sorted_dict[k] = v
+    return sorted_dict
 
 
 JinjaGlobalAttribute = t.Union[str, int, float, bool, AttributeDict]
@@ -355,6 +413,7 @@ class JinjaMacroRegistry(PydanticModel):
         context.update(builtin_globals)
         context.update(root_macros)
         context.update(package_macros)
+        context["render"] = lambda input: env.from_string(input).render()
 
         env.globals.update(context)
         env.filters.update(self._environment.filters)
@@ -440,7 +499,7 @@ class JinjaMacroRegistry(PydanticModel):
                 d.PythonCode(
                     expressions=[
                         f"{k} = '{v}'" if isinstance(v, str) else f"{k} = {v}"
-                        for k, v in sorted(filtered_objs.items())
+                        for k, v in sort_dict_recursive(filtered_objs).items()
                     ]
                 )
             )

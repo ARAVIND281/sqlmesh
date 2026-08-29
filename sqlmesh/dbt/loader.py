@@ -5,11 +5,13 @@ import sys
 import typing as t
 import sqlmesh.core.dialect as d
 from pathlib import Path
+from collections import defaultdict
 from sqlmesh.core.config import (
     Config,
     ConnectionConfig,
     GatewayConfig,
     ModelDefaultsConfig,
+    DbtConfig as RootDbtConfig,
 )
 from sqlmesh.core.environment import EnvironmentStatements
 from sqlmesh.core.loader import CacheBase, LoadedProject, Loader
@@ -48,11 +50,21 @@ def sqlmesh_config(
     dbt_profile_name: t.Optional[str] = None,
     dbt_target_name: t.Optional[str] = None,
     variables: t.Optional[t.Dict[str, t.Any]] = None,
+    threads: t.Optional[int] = None,
     register_comments: t.Optional[bool] = None,
+    infer_state_schema_name: bool = False,
+    profiles_dir: t.Optional[Path] = None,
     **kwargs: t.Any,
 ) -> Config:
     project_root = project_root or Path()
-    context = DbtContext(project_root=project_root, profile_name=dbt_profile_name)
+    context = DbtContext(
+        project_root=project_root, profiles_dir=profiles_dir, profile_name=dbt_profile_name
+    )
+
+    # note: Profile.load() is called twice with different DbtContext's:
+    # - once here with the above DbtContext (to determine connnection / gateway config which has to be set up before everything else)
+    # - again on the SQLMesh side via GenericContext.load() -> DbtLoader._load_projects() -> Project.load() which constructs a fresh DbtContext and ignores the above one
+    # it's important to ensure that the DbtContext created within the DbtLoader uses the same project root / profiles dir that we use here
     profile = Profile.load(context, target_name=dbt_target_name)
     model_defaults = kwargs.pop("model_defaults", ModelDefaultsConfig())
     if model_defaults.dialect is None:
@@ -66,16 +78,45 @@ def sqlmesh_config(
     if not issubclass(loader, DbtLoader):
         raise ConfigError("The loader must be a DbtLoader.")
 
+    if threads is not None:
+        # the to_sqlmesh() function on TargetConfig maps self.threads -> concurrent_tasks
+        profile.target.threads = threads
+
+    gateway_kwargs = {}
+    if infer_state_schema_name:
+        profile_name = context.profile_name
+
+        # Note: we deliberately isolate state based on the target *schema* and not the target name.
+        # It is assumed that the project will define a target, eg 'dev', and then in each users own ~/.dbt/profiles.yml the schema
+        # for the 'dev' target is overriden to something user-specific, rather than making the target name itself user-specific.
+        # This means that the schema name is the indicator of isolated state, not the target name which may be re-used across multiple schemas.
+        target_schema = profile.target.schema_
+
+        # dbt-core doesnt allow schema to be undefined, but it does allow an empty string, and then just
+        # fails at runtime when `CREATE SCHEMA ""` doesnt work
+        if not target_schema:
+            raise ConfigError(
+                f"Target '{profile.target_name}' does not specify a schema.\n"
+                "A schema is required in order to infer where to store SQLMesh state"
+            )
+
+        inferred_state_schema_name = f"sqlmesh_state_{profile_name}_{target_schema}"
+        logger.info("Inferring state schema: %s", inferred_state_schema_name)
+        gateway_kwargs["state_schema"] = inferred_state_schema_name
+
     return Config(
         loader=loader,
+        loader_kwargs=dict(profiles_dir=profiles_dir),
         model_defaults=model_defaults,
         variables=variables or {},
+        dbt=RootDbtConfig(infer_state_schema_name=infer_state_schema_name),
         **{
             "default_gateway": profile.target_name if "gateways" not in kwargs else "",
             "gateways": {
                 profile.target_name: GatewayConfig(
                     connection=profile.target.to_sqlmesh(**target_to_sqlmesh_args),
                     state_connection=state_connection,
+                    **gateway_kwargs,
                 )
             },  # type: ignore
             **kwargs,
@@ -84,14 +125,24 @@ def sqlmesh_config(
 
 
 class DbtLoader(Loader):
-    def __init__(self, context: GenericContext, path: Path) -> None:
+    def __init__(
+        self, context: GenericContext, path: Path, profiles_dir: t.Optional[Path] = None
+    ) -> None:
         self._projects: t.List[Project] = []
         self._macros_max_mtime: t.Optional[float] = None
+        self._profiles_dir = profiles_dir
         super().__init__(context, path)
 
-    def load(self) -> LoadedProject:
+    def load(
+        self,
+        model_fqns: t.Optional[t.Set[str]] = None,
+        use_project_index: bool = False,
+    ) -> LoadedProject:
         self._projects = []
-        return super().load()
+        return super().load(
+            model_fqns=model_fqns,
+            use_project_index=use_project_index,
+        )
 
     def _load_scripts(self) -> t.Tuple[MacroRegistry, JinjaMacroRegistry]:
         macro_files = list(Path(self.config_path, "macros").glob("**/*.sql"))
@@ -112,7 +163,9 @@ class DbtLoader(Loader):
         gateway: t.Optional[str],
         audits: UniqueKeyDict[str, ModelAudit],
         signals: UniqueKeyDict[str, signal],
-    ) -> UniqueKeyDict[str, Model]:
+        model_fqns: t.Optional[t.Set[str]] = None,
+        use_project_index: bool = False,
+    ) -> t.Tuple[UniqueKeyDict[str, Model], t.Optional[t.Set[str]]]:
         models: UniqueKeyDict[str, Model] = UniqueKeyDict("models")
 
         def _to_sqlmesh(config: BMC, context: DbtContext) -> Model:
@@ -137,20 +190,26 @@ class DbtLoader(Loader):
                 package_context.set_and_render_variables(package.variables, package.name)
                 package_models: t.Dict[str, BaseModelConfig] = {**package.models, **package.seeds}
 
+                package_models_by_path: t.Dict[Path, t.List[BaseModelConfig]] = defaultdict(list)
                 for model in package_models.values():
                     if isinstance(model, ModelConfig) and not model.sql.strip():
                         logger.info(f"Skipping empty model '{model.name}' at path '{model.path}'.")
                         continue
+                    package_models_by_path[model.path].append(model)
 
-                    sqlmesh_model = cache.get_or_load_models(
-                        model.path, loader=lambda: [_to_sqlmesh(model, package_context)]
-                    )[0]
-
-                    models[sqlmesh_model.fqn] = sqlmesh_model
+                for path, path_models in package_models_by_path.items():
+                    sqlmesh_models = cache.get_or_load_models(
+                        path,
+                        loader=lambda: [
+                            _to_sqlmesh(model, package_context) for model in path_models
+                        ],
+                    )
+                    for sqlmesh_model in sqlmesh_models:
+                        models[sqlmesh_model.fqn] = sqlmesh_model
 
             models.update(self._load_external_models(audits, cache))
 
-        return models
+        return models, None
 
     def _load_audits(
         self, macros: MacroRegistry, jinja_macros: JinjaMacroRegistry
@@ -165,7 +224,8 @@ class DbtLoader(Loader):
                 for test in package.tests.values():
                     logger.debug("Converting '%s' to sqlmesh format", test.name)
                     try:
-                        audits[test.name] = test.to_sqlmesh(package_context)
+                        audits[test.canonical_name] = test.to_sqlmesh(package_context)
+
                     except BaseMissingReferenceError as e:
                         ref_type = "model" if isinstance(e, MissingModelError) else "source"
                         logger.warning(
@@ -186,6 +246,7 @@ class DbtLoader(Loader):
             project = Project.load(
                 DbtContext(
                     project_root=self.config_path,
+                    profiles_dir=self._profiles_dir,
                     target_name=target_name,
                     sqlmesh_config=self.config,
                 ),

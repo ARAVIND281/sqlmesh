@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlmesh.utils import AttributeDict
+from base64 import b64encode
+
+from sqlmesh.utils import AttributeDict, yaml
 from sqlmesh.utils.jinja import (
     ENVIRONMENT,
     JinjaMacroRegistry,
@@ -302,3 +304,52 @@ macro_a
 
     rendered = registry.build_environment().from_string("{{ spark__macro_a() }}").render()
     assert rendered.strip() == "macro_a"
+
+
+def test_macro_registry_to_expressions_sorted():
+    refs = AttributeDict(
+        {
+            "payments": {
+                "database": "jaffle_shop",
+                "schema": "main",
+                "nested": {"foo": "bar", "baz": "bing"},
+            },
+            "orders": {"schema": "main", "database": "jaffle_shop", "nested_list": ["b", "a", "c"]},
+        }
+    )
+
+    registry = JinjaMacroRegistry()
+    registry.add_globals({"sources": {}, "refs": refs})
+
+    # Ensure that the AttributeDict string representation is sorted
+    # in order to prevent an unexpected *visual* diff in ModelDiff
+    # (note that the actual diff is based on the data hashes, so this is purely visual)
+    expressions = registry.to_expressions()
+    assert len(expressions) == 1
+    assert (
+        expressions[0].sql(dialect="duckdb")
+        == "refs = {'orders': {'database': 'jaffle_shop', 'nested_list': ['a', 'b', 'c'], 'schema': 'main'}, 'payments': {'database': 'jaffle_shop', 'nested': {'baz': 'bing', 'foo': 'bar'}, 'schema': 'main'}}\n"
+        "sources = {}"
+    )
+
+
+def test_builtin_base64_filters():
+    encoded = b64encode(b"secret").decode("utf-8")
+
+    env = JinjaMacroRegistry().build_environment()
+    assert env.from_string("{{ value | b64decode }}").render(value=encoded) == "secret"
+    assert env.from_string("{{ 'secret' | b64encode }}").render() == encoded
+    assert env.from_string("{{ 'secret' | b64encode | b64decode }}").render() == "secret"
+
+    # The same filters are available when rendering Jinja in config YAML files.
+    config = yaml.load(f'env_vars:\n  TOKEN: "{{{{ "{encoded}" | b64decode }}}}"')
+    assert config == {"env_vars": {"TOKEN": "secret"}}
+
+
+def test_builtin_b64decode_with_env_var(monkeypatch):
+    # Real-world use case: a base64-encoded secret stored in an environment variable
+    # is decoded inline in config YAML via env_var(...) piped through b64decode.
+    monkeypatch.setenv("SNOWFLAKE_PW_B64", b64encode(b"super-secret-pw").decode("utf-8"))
+
+    config = yaml.load("password: \"{{ env_var('SNOWFLAKE_PW_B64') | b64decode }}\"")
+    assert config == {"password": "super-secret-pw"}

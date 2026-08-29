@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
-from sqlglot import exp, parse
+from sqlglot import exp, Dialect
 from sqlglot.errors import SqlglotError
 from sqlglot.helper import ensure_list
 from sqlglot.optimizer.annotate_types import annotate_types
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 class BaseExpressionRenderer:
     def __init__(
         self,
-        expression: exp.Expression,
+        expression: exp.Expr,
         dialect: DialectType,
         macro_definitions: t.List[d.MacroDef],
         path: t.Optional[Path] = None,
@@ -73,7 +73,7 @@ class BaseExpressionRenderer:
         self._normalize_identifiers = normalize_identifiers
         self._quote_identifiers = quote_identifiers
         self.update_schema({} if schema is None else schema)
-        self._cache: t.List[t.Optional[exp.Expression]] = []
+        self._cache: t.List[t.Optional[exp.Expr]] = []
         self._model_fqn = model.fqn if model else None
         self._optimize_query_flag = optimize_query is not False
         self._model = model
@@ -91,7 +91,7 @@ class BaseExpressionRenderer:
         deployability_index: t.Optional[DeployabilityIndex] = None,
         runtime_stage: RuntimeStage = RuntimeStage.LOADING,
         **kwargs: t.Any,
-    ) -> t.List[t.Optional[exp.Expression]]:
+    ) -> t.List[t.Optional[exp.Expr]]:
         """Renders a expression, expanding macros with provided kwargs
 
         Args:
@@ -196,9 +196,16 @@ class BaseExpressionRenderer:
             **kwargs,
         }
 
-        variables = kwargs.pop("variables", {})
+        if this_model:
+            render_kwargs["this_model"] = this_model
 
-        expressions = [self._expression]
+        macro_evaluator.locals.update(render_kwargs)
+
+        variables = kwargs.pop("variables", {})
+        if variables:
+            macro_evaluator.locals.setdefault(c.SQLMESH_VARS, {}).update(variables)
+
+        expressions: t.List[exp.Expr] = [self._expression]
         if isinstance(self._expression, d.Jinja):
             try:
                 jinja_env_kwargs = {
@@ -249,23 +256,24 @@ class BaseExpressionRenderer:
                 ) from ex
 
             if rendered_expression.strip():
-                try:
-                    expressions = [e for e in parse(rendered_expression, read=self._dialect) if e]
+                # ensure there is actual SQL and not just comments and non-SQL jinja
+                dialect = Dialect.get_or_raise(self._dialect)
+                tokens = dialect.tokenize(rendered_expression)
 
-                    if not expressions:
-                        raise ConfigError(f"Failed to parse an expression:\n{self._expression}")
-                except Exception as ex:
-                    raise ConfigError(
-                        f"Could not parse the rendered jinja at '{self._path}'.\n{ex}"
-                    ) from ex
+                if tokens:
+                    try:
+                        expressions = [
+                            e for e in dialect.parser().parse(tokens, rendered_expression) if e
+                        ]
 
-        if this_model:
-            render_kwargs["this_model"] = this_model
-
-        macro_evaluator.locals.update(render_kwargs)
-
-        if variables:
-            macro_evaluator.locals.setdefault(c.SQLMESH_VARS, {}).update(variables)
+                        if not expressions:
+                            raise ConfigError(
+                                f"Failed to parse an expression:\n{rendered_expression}"
+                            )
+                    except Exception as ex:
+                        raise ConfigError(
+                            f"Could not parse the rendered jinja at '{self._path}'.\n{ex}"
+                        ) from ex
 
         for definition in self._macro_definitions:
             try:
@@ -275,7 +283,7 @@ class BaseExpressionRenderer:
                     f"Failed to evaluate macro '{definition}'.\n\n{ex}\n", self._path
                 )
 
-        resolved_expressions: t.List[t.Optional[exp.Expression]] = []
+        resolved_expressions: t.List[t.Optional[exp.Expr]] = []
 
         for expression in expressions:
             try:
@@ -286,7 +294,7 @@ class BaseExpressionRenderer:
                     self._path,
                 )
 
-            for expression in t.cast(t.List[exp.Expression], transformed_expressions):
+            for expression in t.cast(t.List[exp.Expr], transformed_expressions):
                 with self._normalize_and_quote(expression) as expression:
                     if hasattr(expression, "selects"):
                         for select in expression.selects:
@@ -312,18 +320,18 @@ class BaseExpressionRenderer:
             self._cache = resolved_expressions
         return resolved_expressions
 
-    def update_cache(self, expression: t.Optional[exp.Expression]) -> None:
+    def update_cache(self, expression: t.Optional[exp.Expr]) -> None:
         self._cache = [expression]
 
     def _resolve_table(
         self,
-        table_name: str | exp.Expression,
+        table_name: str | exp.Expr,
         snapshots: t.Optional[t.Dict[str, Snapshot]] = None,
         table_mapping: t.Optional[t.Dict[str, str]] = None,
         deployability_index: t.Optional[DeployabilityIndex] = None,
     ) -> exp.Table:
         table = exp.replace_tables(
-            exp.maybe_parse(table_name, into=exp.Table, dialect=self._dialect),
+            t.cast(exp.Table, exp.maybe_parse(table_name, into=exp.Table, dialect=self._dialect)),
             {
                 **self._to_table_mapping((snapshots or {}).values(), deployability_index),
                 **(table_mapping or {}),
@@ -372,7 +380,7 @@ class BaseExpressionRenderer:
                     if snapshot.is_model
                 }
 
-                def _expand(node: exp.Expression) -> exp.Expression:
+                def _expand(node: exp.Expr) -> exp.Expr:
                     if isinstance(node, exp.Table) and snapshots:
                         name = exp.table_name(node, identify=True)
                         model = model_mapping.get(name)
@@ -441,7 +449,7 @@ class ExpressionRenderer(BaseExpressionRenderer):
         deployability_index: t.Optional[DeployabilityIndex] = None,
         expand: t.Iterable[str] = tuple(),
         **kwargs: t.Any,
-    ) -> t.Optional[t.List[exp.Expression]]:
+    ) -> t.Optional[t.List[exp.Expr]]:
         try:
             expressions = super()._render(
                 start=start,
@@ -623,7 +631,7 @@ class QueryRenderer(BaseExpressionRenderer):
 
     def update_cache(
         self,
-        expression: t.Optional[exp.Expression],
+        expression: t.Optional[exp.Expr],
         violated_rules: t.Optional[t.Dict[type[Rule], t.Any]] = None,
         optimized: bool = False,
     ) -> None:
@@ -682,7 +690,7 @@ class QueryRenderer(BaseExpressionRenderer):
 
         except Exception as ex:
             raise_config_error(
-                f"Failed to optimize query, please file an issue at https://github.com/TobikoData/sqlmesh/issues/new. {ex}",
+                f"Failed to optimize query, please file an issue at https://github.com/SQLMesh/sqlmesh/issues/new. {ex}",
                 self._path,
             )
 

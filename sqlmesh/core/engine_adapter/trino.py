@@ -71,8 +71,34 @@ class TrinoEngineAdapter(
     MAX_TIMESTAMP_PRECISION = 3
 
     @property
-    def schema_location_mapping(self) -> t.Optional[dict[re.Pattern, str]]:
+    def schema_location_mapping(self) -> t.Optional[t.Dict[re.Pattern, str]]:
         return self._extra_config.get("schema_location_mapping")
+
+    @property
+    def timestamp_mapping(self) -> t.Optional[t.Dict[exp.DataType, exp.DataType]]:
+        return self._extra_config.get("timestamp_mapping")
+
+    def _apply_timestamp_mapping(
+        self, columns_to_types: t.Dict[str, exp.DataType]
+    ) -> t.Tuple[t.Dict[str, exp.DataType], t.Set[str]]:
+        """Apply custom timestamp mapping to column types.
+
+        Returns:
+            A tuple of (mapped_columns_to_types, mapped_column_names) where mapped_column_names
+            contains the names of columns that were found in the mapping.
+        """
+        if not self.timestamp_mapping:
+            return columns_to_types, set()
+
+        result = {}
+        mapped_columns: t.Set[str] = set()
+        for column, column_type in columns_to_types.items():
+            if column_type in self.timestamp_mapping:
+                result[column] = self.timestamp_mapping[column_type]
+                mapped_columns.add(column)
+            else:
+                result[column] = column_type
+        return result, mapped_columns
 
     @property
     def catalog_support(self) -> CatalogSupport:
@@ -86,6 +112,8 @@ class TrinoEngineAdapter(
     def get_catalog_type(self, catalog: t.Optional[str]) -> str:
         row: t.Tuple = tuple()
         if catalog:
+            if catalog_type_override := self._catalog_type_overrides.get(catalog):
+                return catalog_type_override
             row = (
                 self.fetchone(
                     f"select connector_name from system.metadata.catalogs where catalog_name='{catalog}'"
@@ -101,7 +129,7 @@ class TrinoEngineAdapter(
             yield
             return
 
-        if not isinstance(authorization, exp.Expression):
+        if not isinstance(authorization, exp.Expr):
             authorization = exp.Literal.string(authorization)
 
         if not authorization.is_string:
@@ -115,7 +143,7 @@ class TrinoEngineAdapter(
         try:
             yield
         finally:
-            self.execute(f"RESET SESSION AUTHORIZATION")
+            self.execute("RESET SESSION AUTHORIZATION")
 
     def replace_query(
         self,
@@ -282,9 +310,13 @@ class TrinoEngineAdapter(
         column_descriptions: t.Optional[t.Dict[str, str]] = None,
         expressions: t.Optional[t.List[exp.PrimaryKey]] = None,
         is_view: bool = False,
+        materialized: bool = False,
     ) -> exp.Schema:
+        target_columns_to_types, mapped_columns = self._apply_timestamp_mapping(
+            target_columns_to_types
+        )
         if "delta_lake" in self.get_catalog_type_from_table(table):
-            target_columns_to_types = self._to_delta_ts(target_columns_to_types)
+            target_columns_to_types = self._to_delta_ts(target_columns_to_types, mapped_columns)
 
         return super()._build_schema_exp(
             table, target_columns_to_types, column_descriptions, expressions, is_view
@@ -294,13 +326,13 @@ class TrinoEngineAdapter(
         self,
         target_table: TableName,
         source_table: QueryOrDF,
-        unique_key: t.Sequence[exp.Expression],
+        unique_key: t.Sequence[exp.Expr],
         valid_from_col: exp.Column,
         valid_to_col: exp.Column,
         execution_time: t.Union[TimeLike, exp.Column],
         invalidate_hard_deletes: bool = True,
         updated_at_col: t.Optional[exp.Column] = None,
-        check_columns: t.Optional[t.Union[exp.Star, t.Sequence[exp.Column]]] = None,
+        check_columns: t.Optional[t.Union[exp.Star, t.Sequence[exp.Expr]]] = None,
         updated_at_as_valid_from: bool = False,
         execution_time_as_valid_from: bool = False,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
@@ -310,10 +342,15 @@ class TrinoEngineAdapter(
         source_columns: t.Optional[t.List[str]] = None,
         **kwargs: t.Any,
     ) -> None:
+        mapped_columns: t.Set[str] = set()
+        if target_columns_to_types:
+            target_columns_to_types, mapped_columns = self._apply_timestamp_mapping(
+                target_columns_to_types
+            )
         if target_columns_to_types and "delta_lake" in self.get_catalog_type_from_table(
             target_table
         ):
-            target_columns_to_types = self._to_delta_ts(target_columns_to_types)
+            target_columns_to_types = self._to_delta_ts(target_columns_to_types, mapped_columns)
 
         return super()._scd_type_2(
             target_table,
@@ -343,18 +380,21 @@ class TrinoEngineAdapter(
     # - `timestamp(3) with time zone` for timezone-aware
     # https://trino.io/docs/current/connector/delta-lake.html#delta-lake-to-trino-type-mapping
     def _to_delta_ts(
-        self, columns_to_types: t.Dict[str, exp.DataType]
+        self,
+        columns_to_types: t.Dict[str, exp.DataType],
+        skip_columns: t.Optional[t.Set[str]] = None,
     ) -> t.Dict[str, exp.DataType]:
         ts6 = exp.DataType.build("timestamp(6)")
         ts3_tz = exp.DataType.build("timestamp(3) with time zone")
+        skip = skip_columns or set()
 
         delta_columns_to_types = {
-            k: ts6 if v.is_type(exp.DataType.Type.TIMESTAMP) else v
+            k: ts6 if k not in skip and v.is_type(exp.DataType.Type.TIMESTAMP) else v
             for k, v in columns_to_types.items()
         }
 
         delta_columns_to_types = {
-            k: ts3_tz if v.is_type(exp.DataType.Type.TIMESTAMPTZ) else v
+            k: ts3_tz if k not in skip and v.is_type(exp.DataType.Type.TIMESTAMPTZ) else v
             for k, v in delta_columns_to_types.items()
         }
 
@@ -369,7 +409,7 @@ class TrinoEngineAdapter(
         schema_name: SchemaName,
         ignore_if_exists: bool,
         warn_on_error: bool,
-        properties: t.List[exp.Expression],
+        properties: t.List[exp.Expr],
         kind: str,
     ) -> None:
         if mapped_location := self._schema_location(schema_name):
@@ -386,7 +426,7 @@ class TrinoEngineAdapter(
     def _create_table(
         self,
         table_name_or_schema: t.Union[exp.Schema, TableName],
-        expression: t.Optional[exp.Expression],
+        expression: t.Optional[exp.Expr],
         exists: bool = True,
         replace: bool = False,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,

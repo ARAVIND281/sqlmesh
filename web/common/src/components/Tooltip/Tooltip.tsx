@@ -7,13 +7,20 @@ import {
 } from '@radix-ui/react-tooltip'
 import React from 'react'
 
-import { cn } from '@/utils'
-import type { Position } from '@/types'
+import { cn } from '@sqlmesh-common/utils'
 
 import './Tooltip.css'
 
-export type TooltipSide = Extract<Position, 'top' | 'bottom' | 'left' | 'right'>
-export type TooltipAlign = Extract<Position, 'center' | 'start' | 'end'>
+export interface TooltipProps {
+  trigger: React.ReactNode
+  children: React.ReactNode
+  side?: 'top' | 'bottom' | 'left' | 'right'
+  align?: 'center' | 'start' | 'end'
+  delayDuration?: number
+  sideOffset?: number
+  alignOffset?: number
+  className?: string
+}
 
 export function Tooltip({
   delayDuration = 200,
@@ -24,16 +31,7 @@ export function Tooltip({
   trigger,
   children,
   className,
-}: {
-  trigger: React.ReactNode
-  children: React.ReactNode
-  side?: TooltipSide
-  align?: TooltipAlign
-  delayDuration?: number
-  sideOffset?: number
-  alignOffset?: number
-  className?: string
-}) {
+}: TooltipProps) {
   return (
     <TooltipProvider delayDuration={delayDuration}>
       <TooltipRoot>

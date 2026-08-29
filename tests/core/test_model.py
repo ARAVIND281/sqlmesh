@@ -1,6 +1,7 @@
 # ruff: noqa: F811
 import json
 import typing as t
+import re
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch, PropertyMock
@@ -14,7 +15,7 @@ from sqlglot.errors import ParseError
 from sqlglot.schema import MappingSchema
 from sqlmesh.cli.project_init import init_example_project, ProjectTemplate
 from sqlmesh.core.environment import EnvironmentNamingInfo
-from sqlmesh.core.model.kind import TimeColumn, ModelKindName
+from sqlmesh.core.model.kind import TimeColumn, ModelKindName, SeedKind
 
 from sqlmesh import CustomMaterialization, CustomKind
 from pydantic import model_validator, ValidationError
@@ -36,6 +37,7 @@ from sqlmesh.core.context import Context, ExecutionContext
 from sqlmesh.core.dialect import parse
 from sqlmesh.core.engine_adapter.base import MERGE_SOURCE_ALIAS, MERGE_TARGET_ALIAS
 from sqlmesh.core.engine_adapter.duckdb import DuckDBEngineAdapter
+from sqlmesh.core.engine_adapter.shared import DataObjectType
 from sqlmesh.core.macros import MacroEvaluator, macro
 from sqlmesh.core.model import (
     CustomKind,
@@ -51,6 +53,8 @@ from sqlmesh.core.model import (
     TimeColumn,
     ExternalKind,
     ViewKind,
+    EmbeddedKind,
+    SCDType2ByTimeKind,
     create_external_model,
     create_seed_model,
     create_sql_model,
@@ -59,9 +63,9 @@ from sqlmesh.core.model import (
     model,
 )
 from sqlmesh.core.model.common import parse_expression
-from sqlmesh.core.model.kind import ModelKindName, _model_kind_validator
+from sqlmesh.core.model.kind import _ModelKind, ModelKindName, _model_kind_validator
 from sqlmesh.core.model.seed import CsvSettings
-from sqlmesh.core.node import IntervalUnit, _Node
+from sqlmesh.core.node import IntervalUnit, _Node, DbtNodeInfo
 from sqlmesh.core.signal import signal
 from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
 from sqlmesh.utils.date import TimeLike, to_datetime, to_ds, to_timestamp
@@ -330,7 +334,9 @@ FROM "memory"."sushi"."marketing" AS "marketing"
             "@get_date() == '1996-02-10'",
             "'all'",
             3,
-            lambda expected_select: f"{expected_select}\nUNION ALL\n{expected_select}\nUNION ALL\n{expected_select}\n",
+            lambda expected_select: (
+                f"{expected_select}\nUNION ALL\n{expected_select}\nUNION ALL\n{expected_select}\n"
+            ),
         ),
         # Test case 4: DISTINCT type
         (
@@ -370,7 +376,9 @@ FROM "memory"."sushi"."marketing" AS "marketing"
             "",
             "",
             3,
-            lambda expected_select: f"{expected_select}\nUNION ALL\n{expected_select}\n\nUNION ALL\n{expected_select}\n",
+            lambda expected_select: (
+                f"{expected_select}\nUNION ALL\n{expected_select}\n\nUNION ALL\n{expected_select}\n"
+            ),
         ),
         # Test case 9: Missing union type AND condition one table
         (
@@ -460,10 +468,10 @@ def test_model_qualification(tmp_path: Path):
         ctx.upsert_model(load_sql_based_model(expressions))
         ctx.plan_builder("dev")
 
-        assert (
-            """Column '"a"' could not be resolved for model '"db"."table"', the column may not exist or is ambiguous."""
-            in mock_logger.call_args[0][0]
-        )
+        warning_msg = mock_logger.call_args[0][0]
+        assert "ambiguousorinvalidcolumn:" in warning_msg
+        assert "could not be resolved" in warning_msg
+        assert "db.table" in warning_msg
 
 
 @use_terminal_console
@@ -915,7 +923,7 @@ def test_json_serde():
 
     assert (
         SqlModel.parse_obj(model_json_parsed).render_query().sql("duckdb")
-        == 'SELECT REGEXP_MATCHES("x", "y") AS "c"'
+        == 'SELECT REGEXP_FULL_MATCH("x", "y") AS "c"'
     )
 
 
@@ -945,7 +953,7 @@ def test_scd_type_2_by_col_serde():
     model_json_parsed = json.loads(model.json())
     assert model_json_parsed["kind"]["dialect"] == "bigquery"
     assert model_json_parsed["kind"]["unique_key"] == ["`a`"]
-    assert model_json_parsed["kind"]["columns"] == "*"
+    assert model_json_parsed["kind"]["columns"] == ["*"]
     # Bigquery converts TIMESTAMP -> DATETIME
     assert model_json_parsed["kind"]["time_data_type"] == "DATETIME"
 
@@ -1533,6 +1541,44 @@ def test_seed_model_custom_types(tmp_path):
     assert df["empty_date"].iloc[0] is None
 
 
+def test_seed_model_boolean_nulls_are_preserved(tmp_path):
+    model_csv_path = (tmp_path / "model.csv").absolute()
+
+    with open(model_csv_path, "w", encoding="utf-8") as fd:
+        fd.write("id,test_ind\n")
+        fd.write("1,null\n")
+        fd.write("2,false\n")
+        fd.write("3,true\n")
+        fd.write("4,null\n")
+
+    model = create_seed_model(
+        "test_db.test_model",
+        SeedKind(path=str(model_csv_path)),
+        columns={
+            "id": "int",
+            "test_ind": "boolean",
+        },
+        dialect="databricks",
+    )
+
+    df = next(model.render_seed())
+
+    assert df["test_ind"].to_list() == [None, False, True, None]
+
+    context = Context(
+        config=Config(
+            default_connection=DuckDBConnectionConfig(),
+            model_defaults=ModelDefaultsConfig(dialect="databricks"),
+        )
+    )
+    context.upsert_model(model)
+
+    rendered_sql = context.render(model).sql("databricks")
+
+    assert "CAST(NULL AS BOOLEAN)" in rendered_sql
+    assert "(4, NULL)" in rendered_sql
+
+
 def test_seed_with_special_characters_in_column(tmp_path, assert_exp_eq):
     config = Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))
     context = Context(config=config)
@@ -1659,6 +1705,37 @@ def test_audits():
         ("audit_c", {"key": d.MacroVar(this="start_ds")}),
     ]
     assert model.tags == ["foo"]
+
+
+def test_custom_audit_arg_changes_affect_fingerprint():
+    def make_model(min_val: int) -> t.Any:
+        expressions = d.parse(
+            f"""
+            MODEL (
+                name db.model,
+                audits (check_count(min := {min_val}))
+            );
+            SELECT 1 AS id;
+            """
+        )
+        audit_definitions = {
+            "check_count": load_audit(
+                d.parse(
+                    "AUDIT (name check_count); SELECT * FROM @this_model HAVING COUNT(*) < @min"
+                ),
+                dialect="duckdb",
+            )
+        }
+        return load_sql_based_model(
+            expressions,
+            path=Path("./examples/sushi/models/test_model.sql"),
+            audit_definitions=audit_definitions,
+        )
+
+    model_a = make_model(33111)
+    model_b = make_model(5142)
+
+    assert model_a.audit_metadata_hash() != model_b.audit_metadata_hash()
 
 
 def test_enable_audits_from_model_defaults():
@@ -1881,6 +1958,45 @@ def test_render_definition():
     assert "def test_macro(evaluator, v):" in d.format_model_expressions(model.render_definition())
 
 
+def test_tsql_alter_column_post_statement(make_snapshot: t.Callable) -> None:
+    # Issue #5932: the trailing NOT NULL made this parse as a Command, which left @this_model
+    # unresolved and sent the macro to the engine verbatim.
+    expressions = d.parse(
+        """
+        MODEL (
+            name test.test_model,
+            dialect tsql,
+        );
+
+        SELECT 1 AS id;
+
+        @IF(@runtime_stage = 'creating', ALTER TABLE @SQL('@this_model') ALTER COLUMN id INT NOT NULL);
+        """
+    )
+
+    model = load_sql_based_model(expressions, default_catalog="catalog")
+
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    post_statements = model.render_post_statements(
+        snapshots={model.fqn: snapshot},
+        runtime_stage=RuntimeStage.CREATING,
+    )
+
+    assert len(post_statements) == 1
+    assert (
+        post_statements[0].sql(dialect="tsql")
+        == f"ALTER TABLE [catalog].[sqlmesh__test].[test__test_model__{snapshot.version}] /* catalog.test.test_model */ ALTER COLUMN [id] INTEGER NOT NULL"
+    )
+
+    # The statement is skipped outside of the creating stage
+    assert not model.render_post_statements(
+        snapshots={model.fqn: snapshot},
+        runtime_stage=RuntimeStage.EVALUATING,
+    )
+
+
 def test_render_definition_with_defaults():
     query = """
         SELECT
@@ -1922,7 +2038,8 @@ def test_render_definition_with_defaults():
             kind VIEW (
                 materialized FALSE
             ),
-            virtual_environment_mode 'full'
+            virtual_environment_mode 'full',
+            grants_target_layer 'virtual'
         );
 
         {query}
@@ -1933,6 +2050,90 @@ def test_render_definition_with_defaults():
     assert d.format_model_expressions(
         model.render_definition(include_python=False, include_defaults=True)
     ) == d.format_model_expressions(expected_expressions)
+
+
+def test_render_definition_with_grants():
+    from sqlmesh.core.model.meta import GrantsTargetLayer
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name test.grants_model,
+            kind FULL,
+            grants (
+                'select' = ['user1', 'user2'],
+                'insert' = ['admin'],
+                'roles/bigquery.dataViewer' = ['user:data_eng@mycompany.com']
+            ),
+            grants_target_layer all,
+        );
+        SELECT 1 as id
+        """
+    )
+    model = load_sql_based_model(expressions)
+    assert model.grants_target_layer == GrantsTargetLayer.ALL
+    assert model.grants == {
+        "select": ["user1", "user2"],
+        "insert": ["admin"],
+        "roles/bigquery.dataViewer": ["user:data_eng@mycompany.com"],
+    }
+
+    rendered = model.render_definition(include_defaults=True)
+    rendered_text = d.format_model_expressions(rendered)
+    assert "grants_target_layer 'all'" in rendered_text
+    assert re.search(
+        r"grants\s*\("
+        r"\s*'select'\s*=\s*ARRAY\('user1',\s*'user2'\),"
+        r"\s*'insert'\s*=\s*ARRAY\('admin'\),"
+        r"\s*'roles/bigquery.dataViewer'\s*=\s*ARRAY\('user:data_eng@mycompany.com'\)"
+        r"\s*\)",
+        rendered_text,
+    )
+
+    model_with_grants = create_sql_model(
+        name="test_grants_programmatic",
+        query=d.parse_one("SELECT 1 as id"),
+        grants={"select": ["user1", "user2"], "insert": ["admin"]},
+        grants_target_layer=GrantsTargetLayer.ALL,
+    )
+    assert model_with_grants.grants == {"select": ["user1", "user2"], "insert": ["admin"]}
+    assert model_with_grants.grants_target_layer == GrantsTargetLayer.ALL
+    rendered_text = d.format_model_expressions(
+        model_with_grants.render_definition(include_defaults=True)
+    )
+    assert "grants_target_layer 'all'" in rendered_text
+    assert re.search(
+        r"grants\s*\("
+        r"\s*'select'\s*=\s*ARRAY\('user1',\s*'user2'\),"
+        r"\s*'insert'\s*=\s*ARRAY\('admin'\)"
+        r"\s*\)",
+        rendered_text,
+    )
+
+    virtual_expressions = d.parse(
+        """
+        MODEL (
+            name test.virtual_grants_model,
+            kind FULL,
+            grants_target_layer virtual
+        );
+        SELECT 1 as id
+        """
+    )
+    virtual_model = load_sql_based_model(virtual_expressions)
+    assert virtual_model.grants_target_layer == GrantsTargetLayer.VIRTUAL
+
+    default_expressions = d.parse(
+        """
+        MODEL (
+            name test.default_grants_model,
+            kind FULL
+        );
+        SELECT 1 as id
+        """
+    )
+    default_model = load_sql_based_model(default_expressions)
+    assert default_model.grants_target_layer == GrantsTargetLayer.VIRTUAL  # default value
 
 
 def test_render_definition_partitioned_by():
@@ -2063,6 +2264,97 @@ def test_render_definition_partitioned_by():
     )
 
 
+def test_render_definition_clustered_by():
+    # Unquoted AUTO keyword → rendered without backticks or parens
+    for keyword in ("AUTO", "NONE"):
+        model = load_sql_based_model(
+            d.parse(
+                f"""
+            MODEL (
+                name db.test,
+                kind FULL,
+                dialect databricks,
+                clustered_by {keyword}
+            );
+            SELECT 1 AS a
+            """
+            )
+        )
+        assert model.render_definition()[0].sql(pretty=True) == (
+            f"MODEL (\n"
+            f"  name db.test,\n"
+            f"  dialect databricks,\n"
+            f"  kind FULL,\n"
+            f"  clustered_by {keyword}\n"
+            f")"
+        )
+
+    # Backtick-quoted `auto` / `none` → treated as a real column name, rendered quoted
+    for name in ("auto", "none"):
+        model = load_sql_based_model(
+            d.parse(
+                f"""
+            MODEL (
+                name db.test,
+                kind FULL,
+                dialect databricks,
+                clustered_by `{name}`
+            );
+            SELECT 1 AS `{name}`
+            """
+            )
+        )
+        assert model.render_definition()[0].sql(pretty=True) == (
+            f"MODEL (\n"
+            f"  name db.test,\n"
+            f"  dialect databricks,\n"
+            f"  kind FULL,\n"
+            f'  clustered_by "{name}"\n'
+            f")"
+        )
+
+    # Parens-wrapped (AUTO) → treated as a real column name, rendered quoted
+    model = load_sql_based_model(
+        d.parse(
+            """
+        MODEL (
+            name db.test,
+            kind FULL,
+            dialect databricks,
+            clustered_by (auto)
+        );
+        SELECT 1 AS auto
+        """
+        )
+    )
+    assert model.render_definition()[0].sql(pretty=True) == (
+        'MODEL (\n  name db.test,\n  dialect databricks,\n  kind FULL,\n  clustered_by "auto"\n)'
+    )
+
+    # Multi-column → rendered with parens, unchanged
+    model = load_sql_based_model(
+        d.parse(
+            """
+        MODEL (
+            name db.test,
+            kind FULL,
+            dialect databricks,
+            clustered_by (a, b)
+        );
+        SELECT 1 AS a, 2 AS b
+        """
+        )
+    )
+    assert model.render_definition()[0].sql(pretty=True) == (
+        "MODEL (\n"
+        "  name db.test,\n"
+        "  dialect databricks,\n"
+        "  kind FULL,\n"
+        '  clustered_by ("a", "b")\n'
+        ")"
+    )
+
+
 def test_render_definition_with_virtual_update_statements():
     # model has virtual update statements
     model = load_sql_based_model(
@@ -2097,6 +2389,33 @@ def test_render_definition_with_virtual_update_statements():
         == """ON_VIRTUAL_UPDATE_BEGIN;
 GRANT SELECT ON VIEW @this_model TO ROLE role_name;
 ON_VIRTUAL_UPDATE_END;"""
+    )
+
+
+def test_render_definition_dbt_node_info():
+    node_info = DbtNodeInfo(unique_id="model.db.table", name="table", fqn="db.table")
+    model = load_sql_based_model(
+        d.parse(
+            f"""
+        MODEL (
+            name db.table,
+            kind FULL
+        );
+
+        select 1 as a;
+        """
+        ),
+        dbt_node_info=node_info,
+    )
+
+    assert model.dbt_node_info
+    assert (
+        model.render_definition()[0].sql(pretty=True)
+        == """MODEL (
+  name db.table,
+  dbt_node_info (fqn := 'db.table', name := 'table', unique_id := 'model.db.table'),
+  kind FULL
+)"""
     )
 
 
@@ -2438,6 +2757,21 @@ def test_time_column():
     assert model.time_column.format == "%Y-%m"
     assert model.time_column.expression == d.parse_one("(\"ds\", '%Y-%m')")
 
+    expressions = d.parse(
+        """
+        MODEL (
+            name db.table,
+            kind INCREMENTAL_BY_TIME_RANGE(
+                time_column ()
+            )
+        );
+
+        SELECT col::text, ds::text
+    """
+    )
+    with pytest.raises(ConfigError, match="Time Column cannot be empty."):
+        load_sql_based_model(expressions)
+
 
 def test_default_time_column():
     expressions = d.parse(
@@ -2609,6 +2943,156 @@ def test_parse(assert_exp_eq):
         "ds" BETWEEN '1970-01-01' AND '1970-01-01'
     """,
     )
+
+
+def test_dialect_pattern():
+    def make_test_sql(text: str) -> str:
+        return f"""
+        MODEL (
+            name test_model,
+            kind INCREMENTAL_BY_TIME_RANGE(
+                time_column ds
+            ),
+            {text}
+        );
+    
+        SELECT 1;  
+        """
+
+    def assert_match(test_sql: str, expected_value: t.Optional[str] = "duckdb"):
+        match = d.DIALECT_PATTERN.search(test_sql)
+
+        dialect_str: t.Optional[str] = None
+        if expected_value is not None:
+            assert match
+            dialect_str = match.group("dialect")
+
+        assert dialect_str == expected_value
+
+    # single-quoted dialect
+    assert_match(
+        make_test_sql(
+            """
+            dialect 'duckdb',
+            description 'there's a dialect foo in here too!'
+            """
+        )
+    )
+
+    # bare dialect
+    assert_match(
+        make_test_sql(
+            """
+            dialect duckdb,
+            description 'there's a dialect foo in here too!'
+            """
+        )
+    )
+
+    # double-quoted dialect (allowed in BQ)
+    assert_match(
+        make_test_sql(
+            """
+            dialect "duckdb",
+            description 'there's a dialect foo in here too!'
+            """
+        )
+    )
+
+    # no dialect specified, "dialect" in description
+    test_sql = make_test_sql(
+        """
+        description 'there's a dialect foo in here too!'
+        """
+    )
+
+    matches = list(d.DIALECT_PATTERN.finditer(test_sql))
+    assert not matches
+
+    # line comment between properties
+    assert_match(
+        make_test_sql(
+            """
+            tag my_tag, -- comment
+            dialect duckdb
+            """
+        )
+    )
+
+    # block comment between properties
+    assert_match(
+        make_test_sql(
+            """
+            tag my_tag, /* comment */
+            dialect duckdb
+            """
+        )
+    )
+
+    # quoted empty dialect
+    assert_match(
+        make_test_sql(
+            """
+            dialect '',
+            tag my_tag
+            """
+        ),
+        None,
+    )
+
+    # double-quoted empty dialect
+    assert_match(
+        make_test_sql(
+            """
+            dialect "",
+            tag my_tag
+            """
+        ),
+        None,
+    )
+
+    # trailing comment after dialect value
+    assert_match(
+        make_test_sql(
+            """
+            dialect duckdb -- trailing comment
+            """
+        )
+    )
+
+    # dialect value isn't terminated by ',' or ')'
+    test_sql = make_test_sql(
+        """
+        dialect duckdb -- trailing comment
+        tag my_tag
+        """
+    )
+
+    matches = list(d.DIALECT_PATTERN.finditer(test_sql))
+    assert not matches
+
+    # dialect first
+    assert_match(
+        """
+        MODEL(
+          dialect duckdb,
+          name my_name
+        );
+        """
+    )
+
+    # full parse
+    sql = """
+    MODEL (
+        name test_model,
+        description 'this text mentions dialect foo but is not a property'
+    );
+
+    SELECT 1;
+    """
+    expressions = d.parse(sql, default_dialect="duckdb")
+    model = load_sql_based_model(expressions)
+    assert model.dialect == ""
 
 
 CONST = "bar"
@@ -2898,7 +3382,15 @@ def test_python_model_decorator_kind() -> None:
     # no warning with valid kind dict
     with patch.object(get_console(), "log_warning") as mock_logger:
 
-        @model("kind_valid_dict", kind=dict(name=ModelKindName.FULL), columns={'"COL"': "int"})
+        @model(
+            "kind_valid_dict",
+            kind=dict(
+                name=ModelKindName.INCREMENTAL_BY_TIME_RANGE,
+                time_column="ds",
+                auto_restatement_cron="@hourly",
+            ),
+            columns={'"ds"': "date", '"COL"': "int"},
+        )
         def my_model(context):
             pass
 
@@ -2907,9 +3399,31 @@ def test_python_model_decorator_kind() -> None:
             path=Path("."),
         )
 
-        assert isinstance(python_model.kind, FullKind)
+        assert isinstance(python_model.kind, IncrementalByTimeRangeKind)
 
         assert not mock_logger.call_args
+
+
+def test_python_model_decorator_auto_restatement_cron() -> None:
+    @model(
+        "auto_restatement_model",
+        cron="@daily",
+        kind=dict(
+            name=ModelKindName.INCREMENTAL_BY_TIME_RANGE,
+            time_column="ds",
+            auto_restatement_cron="@hourly",
+        ),
+        columns={'"ds"': "date", '"COL"': "int"},
+    )
+    def my_model(context):
+        pass
+
+    python_model = model.get_registry()["auto_restatement_model"].model(
+        module_path=Path("."),
+        path=Path("."),
+    )
+
+    assert python_model.auto_restatement_cron == "@hourly"
 
 
 def test_python_model_decorator_col_descriptions() -> None:
@@ -2934,10 +3448,15 @@ def test_python_model_decorator_col_descriptions() -> None:
     def b_model(context):
         pass
 
-    with pytest.raises(ConfigError, match="a description is provided for column 'COL'"):
+    with patch.object(get_console(), "log_warning") as mock_logger:
         py_model = model.get_registry()["col_descriptions_quoted"].model(
             module_path=Path("."),
             path=Path("."),
+        )
+        assert '"COL"' not in py_model.column_descriptions
+        assert (
+            mock_logger.mock_calls[0].args[0]
+            == "In model 'col_descriptions_quoted', a description is provided for column 'COL' but it is not a column in the model."
         )
 
 
@@ -3349,7 +3868,7 @@ def test_model_ctas_query():
 
     assert (
         load_sql_based_model(expressions, dialect="bigquery").ctas_query().sql()
-        == 'WITH RECURSIVE "a" AS (SELECT * FROM (SELECT * FROM (SELECT * FROM "x" AS "x" WHERE FALSE) AS "_q_0" WHERE FALSE) AS "_q_1" WHERE FALSE), "b" AS (SELECT * FROM "a" AS "a" WHERE FALSE UNION ALL SELECT * FROM "a" AS "a" WHERE FALSE) SELECT * FROM "b" AS "b" WHERE FALSE LIMIT 0'
+        == 'WITH RECURSIVE "a" AS (SELECT * FROM (SELECT * FROM (SELECT * FROM "x" AS "x" WHERE FALSE) AS "_0" WHERE FALSE) AS "_1" WHERE FALSE), "b" AS (SELECT * FROM "a" AS "a" WHERE FALSE UNION ALL SELECT * FROM "a" AS "a" WHERE FALSE) SELECT * FROM "b" AS "b" WHERE FALSE LIMIT 0'
     )
 
     expressions = d.parse(
@@ -3370,7 +3889,7 @@ def test_model_ctas_query():
 
     assert (
         load_sql_based_model(expressions, dialect="bigquery").ctas_query().sql()
-        == 'WITH RECURSIVE "a" AS (WITH "nested_a" AS (SELECT * FROM (SELECT * FROM (SELECT * FROM "x" AS "x" WHERE FALSE) AS "_q_0" WHERE FALSE) AS "_q_1" WHERE FALSE) SELECT * FROM "nested_a" AS "nested_a" WHERE FALSE), "b" AS (SELECT * FROM "a" AS "a" WHERE FALSE UNION ALL SELECT * FROM "a" AS "a" WHERE FALSE) SELECT * FROM "b" AS "b" WHERE FALSE LIMIT 0'
+        == 'WITH RECURSIVE "a" AS (WITH "nested_a" AS (SELECT * FROM (SELECT * FROM (SELECT * FROM "x" AS "x" WHERE FALSE) AS "_0" WHERE FALSE) AS "_1" WHERE FALSE) SELECT * FROM "nested_a" AS "nested_a" WHERE FALSE), "b" AS (SELECT * FROM "a" AS "a" WHERE FALSE UNION ALL SELECT * FROM "a" AS "a" WHERE FALSE) SELECT * FROM "b" AS "b" WHERE FALSE LIMIT 0'
     )
 
 
@@ -3716,6 +4235,138 @@ def test_model_normalization():
         clustered_by=["a", "b"],
     )
     assert model.clustered_by == [exp.to_column('"A"'), exp.to_column('"B"')]
+
+
+@pytest.mark.parametrize("keyword", ["AUTO", "NONE"])
+def test_clustered_by_keyword(keyword: str):
+    # Via SQL DDL
+    expr = d.parse(
+        f"""
+        MODEL (
+            name db.test,
+            kind FULL,
+            dialect databricks,
+            clustered_by {keyword}
+        );
+        SELECT 1 AS a
+        """
+    )
+    model = load_sql_based_model(expr)
+    assert len(model.clustered_by) == 1
+    assert model.clustered_by[0].sql(dialect="databricks").upper() == keyword
+    model.validate_definition()
+
+    # Via Python API with exp.Var
+    model2 = create_sql_model(
+        "db.test",
+        parse_one("SELECT 1 AS a"),
+        dialect="databricks",
+        kind=FullKind(),
+        clustered_by=exp.Var(this=keyword),
+    )
+    assert len(model2.clustered_by) == 1
+    assert model2.clustered_by[0].sql(dialect="databricks").upper() == keyword
+    model2.validate_definition()
+
+    # Via Python API with a plain string — must not silently become a quoted column
+    model3 = create_sql_model(
+        "db.test",
+        parse_one("SELECT 1 AS a"),
+        dialect="databricks",
+        kind=FullKind(),
+        clustered_by=keyword,
+    )
+    assert len(model3.clustered_by) == 1
+    assert isinstance(model3.clustered_by[0], exp.Var)
+    assert model3.clustered_by[0].name.upper() == keyword
+    model3.validate_definition()
+
+
+def test_clustered_by_quoted_keyword_column():
+    """A backtick-quoted column named `auto` or `none` is a real column, not a keyword."""
+    for name in ("auto", "none"):
+        expr = d.parse(
+            f"""
+            MODEL (
+                name db.test,
+                kind FULL,
+                dialect databricks,
+                clustered_by `{name}`
+            );
+            SELECT 1 AS `{name}`
+            """
+        )
+        model = load_sql_based_model(expr)
+        assert len(model.clustered_by) == 1
+        # Must be a Column (quoted identifier), not treated as a keyword
+        assert isinstance(model.clustered_by[0], exp.Column)
+        assert model.clustered_by[0].name.lower() == name
+        model.validate_definition()
+
+
+@pytest.mark.parametrize("keyword", ["AUTO", "NONE"])
+def test_clustered_by_keyword_non_databricks_dialect(keyword: str):
+    """AUTO/NONE should be rejected for non-Databricks dialects as they are meaningless there."""
+    with pytest.raises(ConfigError):
+        model = load_sql_based_model(
+            d.parse(
+                f"""
+                MODEL (
+                    name db.test,
+                    kind FULL,
+                    dialect duckdb,
+                    clustered_by {keyword}
+                );
+                SELECT 1 AS a
+                """
+            )
+        )
+        model.validate_definition()
+
+
+@pytest.mark.parametrize("keyword", ["AUTO", "NONE"])
+def test_clustered_by_mixed_list_pins_behaviour(keyword: str):
+    """clustered_by (a, AUTO) — AUTO alongside a real column is treated as a column named AUTO."""
+    expr = d.parse(
+        f"""
+        MODEL (
+            name db.test,
+            kind FULL,
+            dialect databricks,
+            clustered_by (a, {keyword})
+        );
+        SELECT 1 AS a, 2 AS {keyword.lower()}
+        """
+    )
+    model = load_sql_based_model(expr)
+    # Both entries are real columns (AUTO/NONE inside parens is a column, not a keyword)
+    assert len(model.clustered_by) == 2
+    assert all(isinstance(c_expr, exp.Column) for c_expr in model.clustered_by)
+    model.validate_definition()
+
+
+@pytest.mark.parametrize("keyword", ["AUTO", "NONE"])
+def test_clustered_by_keyword_serialisation_round_trip(keyword: str):
+    """exp.Var(AUTO/NONE) must survive JSON serialisation and deserialisation unchanged."""
+    model = load_sql_based_model(
+        d.parse(
+            f"""
+            MODEL (
+                name db.test,
+                kind FULL,
+                dialect databricks,
+                clustered_by {keyword}
+            );
+            SELECT 1 AS a
+            """
+        )
+    )
+    model_json = model.json()
+    deserialized = SqlModel.parse_raw(model_json)
+    assert deserialized.clustered_by == model.clustered_by
+    assert len(deserialized.clustered_by) == 1
+    assert isinstance(deserialized.clustered_by[0], exp.Var)
+    assert deserialized.clustered_by[0].name.upper() == keyword
 
 
 def test_incremental_unmanaged_validation():
@@ -4388,6 +5039,62 @@ def test_project_level_properties_python_model():
     assert m.interval_unit == IntervalUnit.QUARTER_HOUR
 
 
+def test_explicit_hyphenated_gateway_python_model() -> None:
+    @model(
+        name="model_schema.python_explicit_gateway",
+        kind="full",
+        gateway="secondary-gw",
+        columns={"some_col": "int"},
+    )
+    def python_explicit_gateway(context, **kwargs):
+        yield {"some_col": 1}
+
+    requested_variable_gateways: t.List[t.Optional[str]] = []
+
+    def get_variables(gateway: t.Optional[str]) -> t.Dict[str, str]:
+        requested_variable_gateways.append(gateway)
+        return {}
+
+    loaded_models = model.get_registry()["model_schema.python_explicit_gateway"].models(
+        get_variables=get_variables,
+        module_path=Path("."),
+        path=Path("."),
+        dialect="duckdb",
+        defaults=ModelDefaultsConfig().dict(),
+        default_catalog="default_db",
+        default_catalog_per_gateway={"secondary-gw": "secondary_db"},
+    )
+
+    assert len(loaded_models) == 1
+    assert loaded_models[0].gateway == "secondary-gw"
+    assert loaded_models[0].catalog == "secondary_db"
+    assert requested_variable_gateways == ["secondary-gw"]
+
+
+def test_model_defaults_gateway_python_model() -> None:
+    @model(
+        name="model_schema.python_gateway_default",
+        kind="full",
+        columns={"some_col": "int"},
+    )
+    def python_gateway_default(context, **kwargs):
+        yield {"some_col": 1}
+
+    loaded_models = model.get_registry()["model_schema.python_gateway_default"].models(
+        get_variables=lambda gateway: {},
+        module_path=Path("."),
+        path=Path("."),
+        dialect="duckdb",
+        defaults=ModelDefaultsConfig(gateway="python_gateway").dict(),
+        default_catalog="default_db",
+        default_catalog_per_gateway={"python_gateway": "python_db"},
+    )
+
+    assert len(loaded_models) == 1
+    assert loaded_models[0].gateway == "python_gateway"
+    assert loaded_models[0].catalog == "python_db"
+
+
 def test_model_defaults_macros(make_snapshot):
     model_defaults = ModelDefaultsConfig(
         table_format="@IF(@gateway = 'dev', 'iceberg', NULL)",
@@ -4694,7 +5401,7 @@ def test_model_session_properties(sushi_context):
         )
     )
     assert model.session_properties == {
-        "query_label": parse_one("[('key1', 'value1'), ('key2', 'value2')]")
+        "query_label": parse_one("[('key1', 'value1'), ('key2', 'value2')]", dialect="bigquery")
     }
 
     model = load_sql_based_model(
@@ -4850,6 +5557,90 @@ def test_session_properties_authorization_validation():
             SELECT a FROM tbl;
             """,
                 default_dialect="trino",
+            )
+        )
+
+
+def test_session_properties_query_tags_validation():
+    model = load_sql_based_model(
+        d.parse(
+            """
+        MODEL (
+            name test_schema.test_model,
+            dialect databricks,
+            session_properties (
+                query_tags = MAP('team', 'data-eng', 'app', 'sqlmesh', 'feature', NULL)
+            )
+        );
+        SELECT a FROM tbl;
+        """,
+            default_dialect="databricks",
+        )
+    )
+    assert model.session_properties == {
+        "query_tags": parse_one(
+            "MAP('team', 'data-eng', 'app', 'sqlmesh', 'feature', NULL)",
+            dialect="databricks",
+        )
+    }
+
+    with pytest.raises(
+        ConfigError,
+        match=r"Invalid value for `session_properties.query_tags`. Must be a map.",
+    ):
+        load_sql_based_model(
+            d.parse(
+                """
+            MODEL (
+                name test_schema.test_model,
+                dialect databricks,
+                session_properties (
+                    query_tags = 'invalid value'
+                )
+            );
+            SELECT a FROM tbl;
+            """,
+                default_dialect="databricks",
+            )
+        )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"Invalid key in `session_properties.query_tags`. Keys must be string literals.",
+    ):
+        load_sql_based_model(
+            d.parse(
+                """
+            MODEL (
+                name test_schema.test_model,
+                dialect databricks,
+                session_properties (
+                    query_tags = MAP(1, 'data-eng')
+                )
+            );
+            SELECT a FROM tbl;
+            """,
+                default_dialect="databricks",
+            )
+        )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"Invalid value in `session_properties.query_tags`. Values must be string literals or NULL.",
+    ):
+        load_sql_based_model(
+            d.parse(
+                """
+            MODEL (
+                name test_schema.test_model,
+                dialect databricks,
+                session_properties (
+                    query_tags = MAP('team', 1)
+                )
+            );
+            SELECT a FROM tbl;
+            """,
+                default_dialect="databricks",
             )
         )
 
@@ -5276,7 +6067,7 @@ def test_scd_type_2_python_model() -> None:
             '["col1"]',
             [exp.to_column("col1", quoted=True)],
         ),
-        ("*", exp.Star()),
+        ("*", [exp.Star()]),
     ],
 )
 def test_check_column_variants(input_columns, expected_columns):
@@ -5710,7 +6501,7 @@ def test_when_matched_normalization() -> None:
     assert isinstance(model.kind, IncrementalByUniqueKeyKind)
     assert isinstance(model.kind.when_matched, exp.Whens)
     first_expression = model.kind.when_matched.expressions[0]
-    assert isinstance(first_expression, exp.Expression)
+    assert isinstance(first_expression, exp.Expr)
     assert (
         first_expression.sql(dialect="snowflake")
         == 'WHEN MATCHED THEN UPDATE SET "__MERGE_TARGET__"."KEY_A" = "__MERGE_SOURCE__"."KEY_A", "__MERGE_TARGET__"."KEY_B" = "__MERGE_SOURCE__"."KEY_B"'
@@ -5738,7 +6529,7 @@ def test_when_matched_normalization() -> None:
     assert isinstance(model.kind, IncrementalByUniqueKeyKind)
     assert isinstance(model.kind.when_matched, exp.Whens)
     first_expression = model.kind.when_matched.expressions[0]
-    assert isinstance(first_expression, exp.Expression)
+    assert isinstance(first_expression, exp.Expr)
     assert (
         first_expression.sql(dialect="snowflake")
         == 'WHEN MATCHED THEN UPDATE SET "__MERGE_TARGET__"."kEy_A" = "__MERGE_SOURCE__"."kEy_A", "__MERGE_TARGET__"."kEY_b" = "__MERGE_SOURCE__"."KEY_B"'
@@ -6146,7 +6937,7 @@ def test_end_no_start():
 
 def test_variables():
     @macro()
-    def test_macro_var(evaluator) -> exp.Expression:
+    def test_macro_var(evaluator) -> exp.Expr:
         return exp.convert(evaluator.var("TEST_VAR_D") + 10)
 
     expressions = parse(
@@ -6645,7 +7436,7 @@ def test_unrendered_macros_sql_model(mocker: MockerFixture) -> None:
     # merge_filter will stay unrendered as well
     assert model.unique_key[0] == exp.column("a", quoted=True)
     assert (
-        t.cast(exp.Expression, model.merge_filter).sql()
+        t.cast(exp.Expr, model.merge_filter).sql()
         == '"__MERGE_SOURCE__"."id" > 0 AND "__MERGE_TARGET__"."updated_at" < @end_ds AND "__MERGE_SOURCE__"."updated_at" > @start_ds AND @merge_filter_var'
     )
 
@@ -6848,7 +7639,7 @@ def test_gateway_macro() -> None:
     assert model.render_query_or_raise().sql() == "SELECT 'in_memory' AS \"gateway\""
 
     @macro()
-    def macro_uses_gateway(evaluator) -> exp.Expression:
+    def macro_uses_gateway(evaluator) -> exp.Expr:
         return exp.convert(evaluator.gateway + "_from_macro")
 
     model = load_sql_based_model(
@@ -7430,6 +8221,107 @@ def test_forward_only_on_destructive_change_config() -> None:
     context.upsert_model(model)
     context_model = context.get_model("memory.db.table")
     assert context_model.on_destructive_change.is_allow
+
+
+def test_batch_concurrency_config() -> None:
+    # No batch_concurrency default for incremental models
+    config = Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))
+    context = Context(config=config)
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name memory.db.table,
+            kind INCREMENTAL_BY_TIME_RANGE (
+                time_column c
+            ),
+        );
+        SELECT a, b, c FROM source_table;
+        """
+    )
+    model = load_sql_based_model(expressions, defaults=config.model_defaults.dict())
+    context.upsert_model(model)
+    context_model = context.get_model("memory.db.table")
+    assert context_model.batch_concurrency is None
+
+    # batch_concurrency specified in model defaults applies to incremental models
+    config = Config(model_defaults=ModelDefaultsConfig(dialect="duckdb", batch_concurrency=5))
+    context = Context(config=config)
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name memory.db.table,
+            kind INCREMENTAL_BY_TIME_RANGE (
+                time_column c
+            ),
+        );
+        SELECT a, b, c FROM source_table;
+        """
+    )
+    model = load_sql_based_model(expressions, defaults=config.model_defaults.dict())
+    context.upsert_model(model)
+    context_model = context.get_model("memory.db.table")
+    assert context_model.batch_concurrency == 5
+
+    # batch_concurrency specified in model definition overrides default
+    config = Config(model_defaults=ModelDefaultsConfig(dialect="duckdb", batch_concurrency=5))
+    context = Context(config=config)
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name memory.db.table,
+            kind INCREMENTAL_BY_TIME_RANGE (
+                time_column c,
+                batch_concurrency 10
+            ),
+        );
+        SELECT a, b, c FROM source_table;
+        """
+    )
+    model = load_sql_based_model(expressions, defaults=config.model_defaults.dict())
+    context.upsert_model(model)
+    context_model = context.get_model("memory.db.table")
+    assert context_model.batch_concurrency == 10
+
+    # batch_concurrency default does not apply to non-incremental models
+    config = Config(model_defaults=ModelDefaultsConfig(dialect="duckdb", batch_concurrency=5))
+    context = Context(config=config)
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name memory.db.table,
+            kind FULL,
+        );
+        SELECT a, b, c FROM source_table;
+        """
+    )
+    model = load_sql_based_model(expressions, defaults=config.model_defaults.dict())
+    context.upsert_model(model)
+    context_model = context.get_model("memory.db.table")
+    assert context_model.batch_concurrency is None
+
+    # batch_concurrency default does not apply to INCREMENTAL_BY_UNIQUE_KEY models
+    config = Config(model_defaults=ModelDefaultsConfig(dialect="duckdb", batch_concurrency=5))
+    context = Context(config=config)
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name memory.db.table,
+            kind INCREMENTAL_BY_UNIQUE_KEY (
+                unique_key a
+            ),
+        );
+        SELECT a, b, c FROM source_table;
+        """
+    )
+    model = load_sql_based_model(expressions, defaults=config.model_defaults.dict())
+    context.upsert_model(model)
+    context_model = context.get_model("memory.db.table")
+    assert context_model.batch_concurrency == 1
 
 
 def test_model_meta_on_additive_change_property() -> None:
@@ -8108,7 +9000,7 @@ on_additive_change 'ALLOW'
         .kind.to_expression()
         .sql()
         == """SCD_TYPE_2_BY_COLUMN (
-columns *,
+columns (*),
 execution_time_as_valid_from FALSE,
 unique_key ("a", "b"),
 valid_from_name "valid_from",
@@ -8327,7 +9219,7 @@ def test_merge_filter_macro():
     def predicate(
         evaluator: MacroEvaluator,
         cluster_column: exp.Column,
-    ) -> exp.Expression:
+    ) -> exp.Expr:
         return parse_one(f"source.{cluster_column} > dateadd(day, -7, target.{cluster_column})")
 
     expressions = d.parse(
@@ -9372,9 +10264,9 @@ def test_model_blueprinting(tmp_path: Path) -> None:
         model_defaults=ModelDefaultsConfig(dialect="duckdb"),
     )
 
-    blueprint_sql = tmp_path / "macros" / "identity_macro.py"
-    blueprint_sql.parent.mkdir(parents=True, exist_ok=True)
-    blueprint_sql.write_text(
+    identity_macro = tmp_path / "macros" / "identity_macro.py"
+    identity_macro.parent.mkdir(parents=True, exist_ok=True)
+    identity_macro.write_text(
         """from sqlmesh import macro
 
 @macro()
@@ -9502,7 +10394,7 @@ def entrypoint(evaluator):
         {"customer": SqlValue(sql="customer1"), "customer_field": SqlValue(sql="'bar'")}
     )
 
-    assert t.cast(exp.Expression, customer1_model.render_query()).sql() == (
+    assert t.cast(exp.Expr, customer1_model.render_query()).sql() == (
         """SELECT 'bar' AS "foo", "bar" AS "foo2", 'bar' AS "foo3" FROM "db"."customer1"."my_source" AS "my_source\""""
     )
 
@@ -9515,7 +10407,7 @@ def entrypoint(evaluator):
         {"customer": SqlValue(sql="customer2"), "customer_field": SqlValue(sql="qux")}
     )
 
-    assert t.cast(exp.Expression, customer2_model.render_query()).sql() == (
+    assert t.cast(exp.Expr, customer2_model.render_query()).sql() == (
         '''SELECT "qux" AS "foo", "qux" AS "foo2", "qux" AS "foo3" FROM "db"."customer2"."my_source" AS "my_source"'''
     )
 
@@ -9920,6 +10812,94 @@ def entrypoint(context, *args, **kwargs):
     assert ctx.fetchdf("SELECT * FROM test_schema2.foo").to_dict() == {"id": {0: 1}}
 
 
+def test_python_model_blueprint_column_names(tmp_path: Path) -> None:
+    """Blueprint variables can be used as column names and types in Python model definitions."""
+    py_model = tmp_path / "models" / "blueprint_col_names.py"
+    py_model.parent.mkdir(parents=True, exist_ok=True)
+    py_model.write_text(
+        """
+import pandas as pd  # noqa: TID253
+from sqlmesh import model
+
+@model(
+    "test_schema.@model_name",
+    blueprints=[
+        {"model_name": "hotel_revenue", "col_a": "revenue", "type_a": "int",    "col_b": "cost",   "type_b": "double"},
+        {"model_name": "coffee_sales", "col_a": "sales",   "type_a": "bigint", "col_b": "profit", "type_b": "text"},
+    ],
+    kind="FULL",
+    columns={
+        "@{col_a}": "@{type_a}",
+        "@{col_b}": "@{type_b}",
+    },
+)
+def entrypoint(context, *args, **kwargs):
+    return pd.DataFrame({
+        context.blueprint_var("col_a"): [1],
+        context.blueprint_var("col_b"): [1.5],
+    })
+        """
+    )
+
+    ctx = Context(
+        config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb")),
+        paths=tmp_path,
+    )
+    assert len(ctx.models) == 2
+
+    model1 = ctx.get_model("test_schema.hotel_revenue", raise_if_missing=True)
+    model2 = ctx.get_model("test_schema.coffee_sales", raise_if_missing=True)
+
+    assert model1.columns_to_types_ is not None
+    assert set(model1.columns_to_types_.keys()) == {"revenue", "cost"}
+    assert model1.columns_to_types_["revenue"] == exp.DataType.build("int")
+    assert model1.columns_to_types_["cost"] == exp.DataType.build("double")
+
+    assert model2.columns_to_types_ is not None
+    assert set(model2.columns_to_types_.keys()) == {"sales", "profit"}
+    assert model2.columns_to_types_["sales"] == exp.DataType.build("bigint")
+    assert model2.columns_to_types_["profit"] == exp.DataType.build("text")
+
+
+def test_python_model_variable_column_names(tmp_path: Path) -> None:
+    """Global variables can be used as column names in Python model definitions."""
+    py_model = tmp_path / "models" / "var_col_names.py"
+    py_model.parent.mkdir(parents=True, exist_ok=True)
+    py_model.write_text(
+        """
+import pandas as pd  # noqa: TID253
+from sqlmesh import model
+
+@model(
+    "test_schema.model",
+    kind="FULL",
+    columns={
+        "@{metric_col}": "int",
+        "static_col": "text",
+    },
+)
+def entrypoint(context, *args, **kwargs):
+    return pd.DataFrame({"revenue": [1], "static_col": ["x"]})
+        """
+    )
+
+    ctx = Context(
+        config=Config(
+            model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+            variables={"metric_col": "revenue"},
+        ),
+        paths=tmp_path,
+    )
+    assert len(ctx.models) == 1
+
+    model = ctx.get_model("test_schema.model", raise_if_missing=True)
+
+    assert model.columns_to_types_ is not None
+    assert set(model.columns_to_types_.keys()) == {"revenue", "static_col"}
+    assert model.columns_to_types_["revenue"] == exp.DataType.build("int")
+    assert model.columns_to_types_["static_col"] == exp.DataType.build("text")
+
+
 @time_machine.travel("2020-01-01 00:00:00 UTC")
 def test_dynamic_date_spine_model(assert_exp_eq):
     @macro()
@@ -10301,12 +11281,12 @@ def m4_non_metadata_references_v6(evaluator):
     query_with_vars = macro_evaluator.transform(
         parse_one("SELECT " + ", ".join(f"@v{var}, @VAR('v{var}')" for var in [1, 2, 3, 6]))
     )
-    assert t.cast(exp.Expression, query_with_vars).sql() == "SELECT 1, 1, 2, 2, 3, 3, 6, 6"
+    assert t.cast(exp.Expr, query_with_vars).sql() == "SELECT 1, 1, 2, 2, 3, 3, 6, 6"
 
     query_with_blueprint_vars = macro_evaluator.transform(
         parse_one("SELECT " + ", ".join(f"@v{var}, @BLUEPRINT_VAR('v{var}')" for var in [4, 5]))
     )
-    assert t.cast(exp.Expression, query_with_blueprint_vars).sql() == "SELECT 4, 4, 5, 5"
+    assert t.cast(exp.Expr, query_with_blueprint_vars).sql() == "SELECT 4, 4, 5, 5"
 
 
 def test_variable_mentioned_in_both_metadata_and_non_metadata_macro(tmp_path: Path) -> None:
@@ -11194,6 +12174,35 @@ def test_query_label_and_authorization_macro() -> None:
     }
 
 
+def test_query_tags_macro() -> None:
+    @macro()
+    def test_query_tags_macro(evaluator):
+        return "MAP('team', 'data-eng')"
+
+    expressions = d.parse(
+        """
+        MODEL (
+           name db.table,
+           dialect databricks,
+           session_properties (
+            query_tags = @test_query_tags_macro()
+           )
+        );
+
+        SELECT 1 AS c;
+        """
+    )
+
+    model = load_sql_based_model(expressions)
+    assert model.session_properties == {
+        "query_tags": d.parse_one("@test_query_tags_macro()"),
+    }
+
+    assert model.render_session_properties() == {
+        "query_tags": d.parse_one("MAP('team', 'data-eng')", dialect="databricks"),
+    }
+
+
 def test_boolean_property_validation() -> None:
     expressions = d.parse(
         """
@@ -11618,3 +12627,585 @@ def test_use_original_sql():
     assert model.query_.sql == "SELECT 1 AS one, 2 AS two"
     assert model.pre_statements_[0].sql == "CREATE TABLE pre (a INT)"
     assert model.post_statements_[0].sql == "CREATE TABLE post (b INT)"
+
+
+def test_case_sensitive_macro_locals(tmp_path: Path) -> None:
+    init_example_project(tmp_path, engine_type="duckdb", template=ProjectTemplate.EMPTY)
+
+    db_path = str(tmp_path / "db.db")
+    db_connection = DuckDBConnectionConfig(database=db_path)
+
+    config = Config(
+        gateways={"gw": GatewayConfig(connection=db_connection)},
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+    )
+
+    macro_file = tmp_path / "macros" / "some_macro_with_globals.py"
+    macro_file.parent.mkdir(parents=True, exist_ok=True)
+    macro_file.write_text(
+        """from sqlmesh import macro
+
+x = 1
+X = 2
+
+@macro()
+def my_macro(evaluator):
+    assert evaluator.locals.get("x") == 1
+    assert evaluator.locals.get("X") == 2
+
+    return x + X
+"""
+    )
+    test_model = tmp_path / "models" / "test_model.sql"
+    test_model.parent.mkdir(parents=True, exist_ok=True)
+    test_model.write_text("MODEL (name test_model, kind FULL); SELECT @my_macro() AS c")
+
+    context = Context(paths=tmp_path, config=config)
+    model = context.get_model("test_model", raise_if_missing=True)
+
+    assert model.render_query_or_raise().sql() == 'SELECT 3 AS "c"'
+
+
+def test_grants():
+    expressions = d.parse("""
+        MODEL (
+            name test.table,
+            kind FULL,
+            grants (
+                'select' = ['user1', 123, admin_role, 'user2'],
+                'insert' = 'admin',
+                'roles/bigquery.dataViewer' = ["group:data_eng@company.com", 'user:someone@company.com'],
+                'update' = 'admin'
+            )
+        );
+        SELECT 1 as id
+    """)
+    model = load_sql_based_model(expressions)
+    assert model.grants == {
+        "select": ["user1", "123", "admin_role", "user2"],
+        "insert": ["admin"],
+        "roles/bigquery.dataViewer": ["group:data_eng@company.com", "user:someone@company.com"],
+        "update": ["admin"],
+    }
+
+    model = create_sql_model(
+        "db.table",
+        parse_one("SELECT 1 AS id"),
+        kind="FULL",
+        grants={
+            "select": ["user1", "user2"],
+            "insert": ["admin"],
+            "roles/bigquery.dataViewer": "user:data_eng@company.com",
+        },
+    )
+    assert model.grants == {
+        "select": ["user1", "user2"],
+        "insert": ["admin"],
+        "roles/bigquery.dataViewer": ["user:data_eng@company.com"],
+    }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "FULL",
+        "VIEW",
+        SeedKind(path="test.csv"),
+        IncrementalByTimeRangeKind(time_column="ds"),
+        IncrementalByUniqueKeyKind(unique_key="id"),
+    ],
+)
+def test_grants_valid_model_kinds(kind: t.Union[str, _ModelKind]):
+    model = create_sql_model(
+        "db.table",
+        parse_one("SELECT 1 AS id"),
+        kind=kind,
+        grants={"select": ["user1", "user2"], "insert": ["admin_user"]},
+    )
+    assert model.grants == {"select": ["user1", "user2"], "insert": ["admin_user"]}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "EXTERNAL",
+        "EMBEDDED",
+    ],
+)
+def test_grants_invalid_model_kind_errors(kind: str):
+    with pytest.raises(ValidationError, match=rf".*grants cannot be set for {kind}.*"):
+        create_sql_model(
+            "db.table",
+            parse_one("SELECT 1 AS id"),
+            kind=kind,
+            grants={"select": ["user1"], "insert": ["admin_user"]},
+        )
+
+
+def test_model_kind_supports_grants():
+    assert FullKind().supports_grants is True
+    assert ViewKind().supports_grants is True
+    assert IncrementalByTimeRangeKind(time_column="ds").supports_grants is True
+    assert IncrementalByUniqueKeyKind(unique_key=["id"]).supports_grants is True
+    assert SCDType2ByTimeKind(unique_key=["id"]).supports_grants is True
+
+    assert EmbeddedKind().supports_grants is False
+    assert ExternalKind().supports_grants is False
+
+
+def test_grants_validation_no_grants():
+    model = create_sql_model("db.table", parse_one("SELECT 1 AS id"), kind="FULL")
+    assert model.grants is None
+
+
+def test_grants_validation_empty_grantees():
+    model = create_sql_model(
+        "db.table", parse_one("SELECT 1 AS id"), kind="FULL", grants={"select": []}
+    )
+    assert model.grants == {"select": []}
+
+
+def test_grants_single_value_conversions():
+    expressions = d.parse(f"""
+        MODEL (
+            name test.nested_arrays,
+            kind FULL,
+            grants (
+                'select' = "user1", update = user2
+            )
+        );
+        SELECT 1 as id
+    """)
+    model = load_sql_based_model(expressions)
+    assert model.grants == {"select": ["user1"], "update": ["user2"]}
+
+    model = create_sql_model(
+        "db.table",
+        parse_one("SELECT 1 AS id"),
+        kind="FULL",
+        grants={"select": "user1", "insert": 123},
+    )
+    assert model.grants == {"select": ["user1"], "insert": ["123"]}
+
+
+@pytest.mark.parametrize(
+    "grantees",
+    [
+        "('user1', ('user2', 'user3'), 'user4')",
+        "('user1', ['user2', 'user3'], user4)",
+        "['user1', ['user2', user3], 'user4']",
+        "[user1, ('user2', \"user3\"), 'user4']",
+    ],
+)
+def test_grants_array_flattening(grantees: str):
+    expressions = d.parse(f"""
+        MODEL (
+            name test.nested_arrays,
+            kind FULL,
+            grants (
+                'select' = {grantees}
+            )
+        );
+        SELECT 1 as id
+    """)
+    model = load_sql_based_model(expressions)
+    assert model.grants == {"select": ["user1", "user2", "user3", "user4"]}
+
+
+def test_grants_macro_var_resolved():
+    expressions = d.parse("""
+        MODEL (
+            name test.macro_grants,
+            kind FULL,
+            grants (
+                'select' = @VAR('readers'),
+                'insert' = @VAR('writers')
+            )
+        );
+        SELECT 1 as id
+    """)
+    model = load_sql_based_model(
+        expressions, variables={"readers": ["user1", "user2"], "writers": "admin"}
+    )
+    assert model.grants == {
+        "select": ["user1", "user2"],
+        "insert": ["admin"],
+    }
+
+
+def test_grants_macro_var_in_array_flattening():
+    expressions = d.parse("""
+        MODEL (
+            name test.macro_in_array,
+            kind FULL,
+            grants (
+                'select' = ['user1', @VAR('admins'), 'user3']
+            )
+        );
+        SELECT 1 as id
+    """)
+
+    model = load_sql_based_model(expressions, variables={"admins": ["admin1", "admin2"]})
+    assert model.grants == {"select": ["user1", "admin1", "admin2", "user3"]}
+
+    model2 = load_sql_based_model(expressions, variables={"admins": "super_admin"})
+    assert model2.grants == {"select": ["user1", "super_admin", "user3"]}
+
+
+def test_grants_dynamic_permission_names():
+    expressions = d.parse("""
+        MODEL (
+            name test.dynamic_keys,
+            kind FULL,
+            grants (
+                @VAR('read_perm') = ['user1', 'user2'],
+                @VAR('write_perm') = ['admin']
+            )
+        );
+        SELECT 1 as id
+    """)
+    model = load_sql_based_model(
+        expressions, variables={"read_perm": "select", "write_perm": "insert"}
+    )
+    assert model.grants == {"select": ["user1", "user2"], "insert": ["admin"]}
+
+
+def test_grants_unresolved_macro_errors():
+    expressions1 = d.parse("""
+        MODEL (name test.bad1, kind FULL, grants ('select' = @VAR('undefined')));
+        SELECT 1 as id
+    """)
+    with pytest.raises(ConfigError, match=r"Invalid grants configuration for 'select': NULL value"):
+        load_sql_based_model(expressions1)
+
+    expressions2 = d.parse("""
+        MODEL (name test.bad2, kind FULL, grants (@VAR('undefined') = ['user']));
+        SELECT 1 as id
+    """)
+    with pytest.raises(ConfigError, match=r"Invalid grants configuration.*NULL value"):
+        load_sql_based_model(expressions2)
+
+    expressions3 = d.parse("""
+        MODEL (name test.bad3, kind FULL, grants ('select' = ['user', @VAR('undefined')]));
+        SELECT 1 as id
+    """)
+    with pytest.raises(ConfigError, match=r"Invalid grants configuration for 'select': NULL value"):
+        load_sql_based_model(expressions3)
+
+
+def test_grants_empty_values():
+    model1 = create_sql_model(
+        "db.table", parse_one("SELECT 1 AS id"), kind="FULL", grants={"select": []}
+    )
+    assert model1.grants == {"select": []}
+
+    model2 = create_sql_model("db.table", parse_one("SELECT 1 AS id"), kind="FULL")
+    assert model2.grants is None
+
+
+@pytest.mark.parametrize(
+    "kind, expected",
+    [
+        ("VIEW", DataObjectType.VIEW),
+        ("FULL", DataObjectType.TABLE),
+        ("MANAGED", DataObjectType.MANAGED_TABLE),
+        (ViewKind(materialized=True), DataObjectType.MATERIALIZED_VIEW),
+    ],
+)
+def test_grants_table_type(kind: t.Union[str, _ModelKind], expected: DataObjectType):
+    model = create_sql_model("test_table", parse_one("SELECT 1 as id"), kind=kind)
+    assert model.grants_table_type == expected
+
+
+def test_model_macro_using_locals_called_from_jinja(assert_exp_eq) -> None:
+    @macro()
+    def execution_date(evaluator):
+        return f"""'{evaluator.locals.get("execution_date")}'"""
+
+    expressions = d.parse(
+        """
+        MODEL (name db.table);
+
+        JINJA_QUERY_BEGIN;
+        SELECT {{ execution_date() }} AS col;
+        JINJA_END;
+        """
+    )
+    model = load_sql_based_model(expressions)
+    assert_exp_eq(model.render_query(), '''SELECT '1970-01-01' AS "col"''')
+
+
+def test_audits_in_embedded_model():
+    expression = d.parse(
+        """
+        MODEL (
+            name test.embedded_with_audits,
+            kind EMBEDDED,
+            audits (not_null (columns := (id)))
+        );
+
+        SELECT 1 AS id, 'A' as value
+        """
+    )
+    with pytest.raises(ConfigError, match="Audits are not supported for embedded models"):
+        load_sql_based_model(expression).validate_definition()
+
+
+def test_default_catalog_not_leaked_to_unsupported_gateway():
+    """
+    Regression test for https://github.com/SQLMesh/sqlmesh/issues/5748
+
+    When a model targets a gateway that is NOT in default_catalog_per_gateway,
+    the global default_catalog should be cleared (set to None) instead of
+    leaking through from the default gateway.
+    """
+    from sqlglot import parse
+
+    expressions = parse(
+        """
+        MODEL (
+            name my_schema.my_model,
+            kind FULL,
+            gateway clickhouse_gw,
+            dialect clickhouse,
+        );
+
+        SELECT 1 AS id
+        """,
+        read="clickhouse",
+    )
+
+    default_catalog_per_gateway = {
+        "default_gw": "example_catalog",
+    }
+
+    models = load_sql_based_models(
+        expressions,
+        get_variables=lambda gw: {},
+        dialect="clickhouse",
+        default_catalog_per_gateway=default_catalog_per_gateway,
+        default_catalog="example_catalog",
+    )
+
+    assert len(models) == 1
+    model = models[0]
+
+    assert not model.catalog, (
+        f"Default gateway catalog leaked into catalog-unsupported gateway model. "
+        f"Expected no catalog, got: {model.catalog}"
+    )
+    assert "example_catalog" not in model.fqn, (
+        f"Default gateway catalog found in model FQN: {model.fqn}"
+    )
+
+
+def test_default_catalog_still_applied_to_supported_gateway():
+    """
+    Control test: when a model targets a gateway that IS in default_catalog_per_gateway,
+    the catalog should still be correctly applied.
+    """
+    from sqlglot import parse
+
+    expressions = parse(
+        """
+        MODEL (
+            name my_schema.my_model,
+            kind FULL,
+            gateway other_duckdb,
+        );
+
+        SELECT 1 AS id
+        """,
+        read="duckdb",
+    )
+
+    default_catalog_per_gateway = {
+        "default_gw": "example_catalog",
+        "other_duckdb": "other_db",
+    }
+
+    models = load_sql_based_models(
+        expressions,
+        get_variables=lambda gw: {},
+        dialect="duckdb",
+        default_catalog_per_gateway=default_catalog_per_gateway,
+        default_catalog="example_catalog",
+    )
+
+    assert len(models) == 1
+    model = models[0]
+
+    assert model.catalog == "other_db", f"Expected catalog 'other_db', got: {model.catalog}"
+
+
+@pytest.mark.parametrize(
+    ("model_gateway", "expected_gateway", "expected_catalog"),
+    [
+        (None, "secondary-gw", "secondary_db"),
+        ("default_gw", "default_gw", "example_catalog"),
+    ],
+)
+def test_model_defaults_gateway(
+    model_gateway: t.Optional[str], expected_gateway: str, expected_catalog: str
+) -> None:
+    """A project-level gateway default controls loading unless the model overrides it."""
+    gateway_property = f"gateway {model_gateway}," if model_gateway else ""
+    expressions = d.parse(
+        f"""
+        MODEL (
+            name my_schema.my_model,
+            kind FULL,
+            {gateway_property}
+        );
+
+        SELECT 1 AS id
+        """,
+        default_dialect="duckdb",
+    )
+    requested_variable_gateways: t.List[t.Optional[str]] = []
+
+    def get_variables(gateway: t.Optional[str]) -> t.Dict[str, str]:
+        requested_variable_gateways.append(gateway)
+        return {}
+
+    models = load_sql_based_models(
+        expressions,
+        get_variables=get_variables,
+        defaults=ModelDefaultsConfig(gateway="secondary-gw").dict(),
+        dialect="duckdb",
+        default_catalog_per_gateway={
+            "default_gw": "example_catalog",
+            "secondary-gw": "secondary_db",
+        },
+        default_catalog="example_catalog",
+    )
+
+    assert len(models) == 1
+    assert models[0].gateway == expected_gateway
+    assert models[0].catalog == expected_catalog
+    assert requested_variable_gateways == [expected_gateway]
+
+
+def test_model_defaults_gateway_with_blueprints() -> None:
+    expressions = d.parse(
+        """
+        MODEL (
+            name model_@suffix.my_model,
+            kind FULL,
+            blueprints (
+                (suffix := one),
+                (suffix := two),
+            ),
+        );
+
+        SELECT 1 AS id
+        """,
+        default_dialect="duckdb",
+    )
+
+    models = load_sql_based_models(
+        expressions,
+        get_variables=lambda gateway: {},
+        defaults=ModelDefaultsConfig(gateway="other_duckdb").dict(),
+        dialect="duckdb",
+        default_catalog_per_gateway={"other_duckdb": "other_db"},
+        default_catalog="example_catalog",
+    )
+
+    assert {model.gateway for model in models} == {"other_duckdb"}
+    assert {model.catalog for model in models} == {"other_db"}
+
+
+def test_external_model_does_not_inherit_model_defaults_gateway() -> None:
+    default_external_model = create_external_model(
+        "source_schema.default_source",
+        defaults=ModelDefaultsConfig(gateway="managed_gateway").dict(),
+    )
+    explicit_external_model = create_external_model(
+        "source_schema.explicit_source",
+        defaults=ModelDefaultsConfig(gateway="managed_gateway").dict(),
+        gateway="source_gateway",
+    )
+
+    assert default_external_model.gateway is None
+    assert explicit_external_model.gateway == "source_gateway"
+
+
+def test_no_gateway_uses_global_default_catalog():
+    """
+    Control test: when a model does NOT specify a gateway, the global
+    default_catalog should still be applied as before.
+    """
+    from sqlglot import parse
+
+    expressions = parse(
+        """
+        MODEL (
+            name my_schema.my_model,
+            kind FULL,
+        );
+
+        SELECT 1 AS id
+        """,
+        read="duckdb",
+    )
+
+    model = load_sql_based_model(
+        expressions,
+        default_catalog="example_catalog",
+        dialect="duckdb",
+    )
+
+    assert model.catalog == "example_catalog"
+
+
+def test_blueprint_catalog_not_cross_contaminated():
+    """
+    When blueprints iterate over different gateways, the catalog from one
+    blueprint iteration should not leak into the next. A ClickHouse blueprint
+    setting default_catalog to None should not prevent the following blueprint
+    from getting its correct catalog.
+    """
+    from sqlglot import parse
+
+    expressions = parse(
+        """
+        MODEL (
+            name @{blueprint}.my_model,
+            kind FULL,
+            gateway @{gw},
+            blueprints (
+                (blueprint := ch_schema, gw := clickhouse_gw),
+                (blueprint := db_schema, gw := default_gw),
+            ),
+        );
+
+        SELECT 1 AS id
+        """,
+        read="duckdb",
+    )
+
+    default_catalog_per_gateway = {
+        "default_gw": "example_catalog",
+    }
+
+    models = load_sql_based_models(
+        expressions,
+        get_variables=lambda gw: {},
+        dialect="duckdb",
+        default_catalog_per_gateway=default_catalog_per_gateway,
+        default_catalog="example_catalog",
+    )
+
+    assert len(models) == 2
+
+    ch_model = next(m for m in models if "ch_schema" in m.fqn)
+    db_model = next(m for m in models if "db_schema" in m.fqn)
+
+    assert not ch_model.catalog, (
+        f"Catalog leaked into ClickHouse blueprint. Got: {ch_model.catalog}"
+    )
+
+    assert db_model.catalog == "example_catalog", (
+        f"Catalog lost for DuckDB blueprint after ClickHouse iteration. Got: {db_model.catalog}"
+    )

@@ -81,7 +81,7 @@ def table_diff(adapter: AthenaEngineAdapter) -> TableDiff:
 def test_table_location(
     adapter: AthenaEngineAdapter,
     config_s3_warehouse_location: t.Optional[str],
-    table_properties: t.Optional[t.Dict[str, exp.Expression]],
+    table_properties: t.Optional[t.Dict[str, exp.Expr]],
     table: exp.Table,
     expected_location: t.Optional[str],
 ) -> None:
@@ -312,6 +312,7 @@ def test_replace_query(adapter: AthenaEngineAdapter, mocker: MockerFixture):
     )
     mocker.patch.object(adapter, "_get_data_objects", return_value=[])
     adapter.cursor.execute.reset_mock()
+    adapter._clear_data_object_cache()
 
     adapter.s3_warehouse_location = "s3://foo"
     adapter.replace_query(

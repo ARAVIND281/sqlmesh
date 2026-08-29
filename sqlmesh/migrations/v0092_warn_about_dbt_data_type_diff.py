@@ -5,7 +5,7 @@ SQLMesh previously treated dbt's schema.yml data_type field as columns_to_types,
 doesn't match dbt's behavior. dbt only uses data_type for contracts/validation, not DDL.
 This fix may cause diffs if tables were created with incorrect types.
 
-More context: https://github.com/TobikoData/sqlmesh/pull/5231
+More context: https://github.com/SQLMesh/sqlmesh/pull/5231
 """
 
 import json
@@ -17,13 +17,11 @@ from sqlmesh.core.console import get_console
 SQLMESH_DBT_PACKAGE = "sqlmesh.dbt"
 
 
-def migrate_schemas(state_sync, **kwargs):  # type: ignore
+def migrate_schemas(engine_adapter, schema, **kwargs):  # type: ignore
     pass
 
 
-def migrate_rows(state_sync, **kwargs):  # type: ignore
-    engine_adapter = state_sync.engine_adapter
-    schema = state_sync.schema
+def migrate_rows(engine_adapter, schema, **kwargs):  # type: ignore
     snapshots_table = "_snapshots"
     if schema:
         snapshots_table = f"{schema}.{snapshots_table}"
@@ -35,7 +33,7 @@ def migrate_rows(state_sync, **kwargs):  # type: ignore
         "tables may have been created with incorrect column types. After this migration, run "
         "'sqlmesh diff prod' to check for column type differences, and if any are found, "
         "apply a plan to correct the table schemas. For more details, see: "
-        "https://github.com/TobikoData/sqlmesh/pull/5231."
+        "https://github.com/SQLMesh/sqlmesh/pull/5231."
     )
 
     for (snapshot,) in engine_adapter.fetchall(

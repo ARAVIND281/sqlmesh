@@ -770,6 +770,42 @@ test_foo:
         ).run()
     )
 
+    #  - output df must differ if sorted by (id, event_date) vs. (event_date, id)
+    #  - output partial must be true
+    _check_successful_or_raise(
+        _create_test(
+            body=load_yaml(
+                """
+test_foo:
+  model: sushi.foo
+  inputs:
+    sushi.items:
+      - id: 9876
+        event_date: 2020-01-01
+      - id: 1234
+        name: hello
+        event_date: 2020-01-02
+  outputs:
+    partial: true
+    query:
+      - event_date: 2020-01-01
+        id: 9876
+      - event_date: 2020-01-02
+        id: 1234
+        name: hello
+                """
+            ),
+            test_name="test_foo",
+            model=sushi_context.upsert_model(
+                _create_model(
+                    "SELECT id, name, price, event_date FROM sushi.items",
+                    default_catalog=sushi_context.default_catalog,
+                )
+            ),
+            context=sushi_context,
+        ).run()
+    )
+
 
 def test_partial_data_missing_schemas(sushi_context: Context) -> None:
     _check_successful_or_raise(
@@ -1149,6 +1185,27 @@ test_foo:
     )
 
 
+def test_invalid_outputs_error() -> None:
+    with pytest.raises(TestError, match="Incomplete test, outputs must contain 'query' or 'ctes'"):
+        _create_test(
+            body=load_yaml(
+                """
+test_foo:
+  model: sushi.foo
+  inputs:
+    raw:
+      - id: 1
+  outputs:
+    rows:
+      - id: 1
+                """
+            ),
+            test_name="test_foo",
+            model=_create_model("SELECT id FROM raw"),
+            context=Context(config=Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))),
+        )
+
+
 def test_empty_rows(sushi_context: Context) -> None:
     _check_successful_or_raise(
         _create_test(
@@ -1482,6 +1539,9 @@ def test_gateway(copy_to_temp_path: t.Callable, mocker: MockerFixture) -> None:
     with open(test_path, "w", encoding="utf-8") as file:
         dump_yaml(test_dict, file)
 
+    # Re-initialize context to pick up the modified test file
+    context = Context(paths=path, config=config)
+
     spy_execute = mocker.spy(EngineAdapter, "_execute")
     mocker.patch("sqlmesh.core.test.definition.random_id", return_value="jzngz56a")
 
@@ -1658,10 +1718,12 @@ test_foo:
         )
 
 
+@pytest.mark.pyspark
 def test_pyspark_python_model(tmp_path: Path) -> None:
     spark_connection_config = SparkConnectionConfig(
         config={
             "spark.master": "local",
+            "spark.driver.memory": "512m",
             "spark.sql.warehouse.dir": f"{tmp_path}/data_dir",
             "spark.driver.extraJavaOptions": f"-Dderby.system.home={tmp_path}/derby_dir",
         },
@@ -2391,6 +2453,9 @@ test_example_full_model:
         copy_test_file(original_test_file, tmp_path / "tests" / f"test_success_{i}.yaml", i)
         copy_test_file(new_test_file, tmp_path / "tests" / f"test_failure_{i}.yaml", i)
 
+    # Re-initialize context to pick up the new test files
+    context = Context(paths=tmp_path, config=config)
+
     with capture_output() as captured_output:
         context.test()
 
@@ -2406,13 +2471,12 @@ test_example_full_model:
         "SELECT 1 AS col_1, 2 AS col_2, 3 AS col_3, 4 AS col_4, 5 AS col_5, 6 AS col_6, 7 AS col_7"
     )
 
-    context.upsert_model(
-        _create_model(
-            meta="MODEL(name test.test_wide_model)",
-            query=wide_model_query,
-            default_catalog=context.default_catalog,
-        )
+    wide_model = _create_model(
+        meta="MODEL(name test.test_wide_model)",
+        query=wide_model_query,
+        default_catalog=context.default_catalog,
     )
+    context.upsert_model(wide_model)
 
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
@@ -2435,6 +2499,9 @@ test_example_full_model:
     """
 
     wide_test_file.write_text(wide_test_file_content)
+
+    context.load()
+    context.upsert_model(wide_model)
 
     with capture_output() as captured_output:
         context.test()
@@ -2491,6 +2558,9 @@ test_null_third_row:
         num_orders: null
         """
     )
+
+    # Re-initialize context to pick up the modified test file
+    context = Context(paths=tmp_path, config=config)
 
     with capture_output() as captured_output:
         context.test()
@@ -3310,6 +3380,56 @@ test_default_vars:
     _check_successful_or_raise(test_default_vars.run())
 
 
+def test_python_model_sorting(tmp_path: Path) -> None:
+    py_model = tmp_path / "models" / "test_sort_model.py"
+    py_model.parent.mkdir(parents=True, exist_ok=True)
+    py_model.write_text(
+        """
+import pandas as pd  # noqa: TID253
+from sqlmesh import model, ExecutionContext
+import typing as t
+
+@model(
+  name="test_sort_model",
+  columns={"id": "int", "value": "varchar"},
+)
+def execute(context: ExecutionContext, **kwargs: t.Any) -> pd.DataFrame:
+  # Return rows in a potentially non-deterministic order
+  # (simulating a model that doesn't guarantee order)
+  return pd.DataFrame([
+      {"id": 3, "value": "c"},
+      {"id": 1, "value": "a"},
+      {"id": 2, "value": "b"},
+  ])"""
+    )
+
+    config = Config(model_defaults=ModelDefaultsConfig(dialect="duckdb"))
+    context = Context(config=config, paths=tmp_path)
+
+    python_model = context.models['"test_sort_model"']
+
+    _check_successful_or_raise(
+        _create_test(
+            body=load_yaml("""
+    test_without_sort:
+      model: test_sort_model
+      outputs:
+        query:
+          rows:
+            - id: 1
+              value: "a"
+            - id: 2
+              value: "b"
+            - id: 3
+              value: "c"
+            """),
+            test_name="test_without_sort",
+            model=python_model,
+            context=context,
+        ).run()
+    )
+
+
 @use_terminal_console
 def test_cte_failure(tmp_path: Path) -> None:
     models_dir = tmp_path / "models"
@@ -3365,6 +3485,9 @@ test_foo:
     """
     )
 
+    # Re-initialize context to pick up the new test file
+    context = Context(paths=tmp_path, config=config)
+
     with capture_output() as captured_output:
         context.test()
 
@@ -3390,6 +3513,9 @@ test_foo:
       - id: 2
     """
     )
+
+    # Re-initialize context to pick up the modified test file
+    context = Context(paths=tmp_path, config=config)
 
     with capture_output() as captured_output:
         context.test()

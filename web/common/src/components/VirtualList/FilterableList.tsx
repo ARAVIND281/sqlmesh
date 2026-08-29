@@ -4,9 +4,21 @@ import React from 'react'
 import { VerticalContainer } from '../VerticalContainer/VerticalContainer'
 import { HorizontalContainer } from '../HorizontalContainer/HorizontalContainer'
 import { Badge } from '../Badge/Badge'
-import { cn } from '@/utils'
-import MessageContainer from '../MessageContainer/MessageContainer'
+import { cn } from '@sqlmesh-common/utils'
+import { MessageContainer } from '../MessageContainer/MessageContainer'
 import { Input } from '../Input/Input'
+
+import './FilterableList.css'
+
+export interface FilterableListProps<TItem> {
+  items: TItem[]
+  filterOptions?: IFuseOptions<TItem>
+  disabled?: boolean
+  placeholder?: string
+  autoFocus?: boolean
+  className?: string
+  children: (options: TItem[], resetSearch: () => void) => React.ReactNode
+}
 
 export function FilterableList<TItem>({
   items,
@@ -16,15 +28,7 @@ export function FilterableList<TItem>({
   filterOptions,
   className,
   children,
-}: {
-  items: TItem[]
-  filterOptions?: IFuseOptions<TItem>
-  disabled?: boolean
-  placeholder?: string
-  autoFocus?: boolean
-  className?: string
-  children: (options: TItem[], resetSearch: () => void) => React.ReactNode
-}) {
+}: FilterableListProps<TItem>) {
   const [search, setSearch] = React.useState('')
 
   const fuse = new Fuse(items, filterOptions)
@@ -53,7 +57,10 @@ export function FilterableList<TItem>({
             setSearch(e.target.value)
           }
           inputSize="xs"
-          className="w-full"
+          className="FilterableList__Input w-full"
+          onClick={(e: React.MouseEvent<HTMLInputElement>) => {
+            e.stopPropagation()
+          }}
         />
         <Counter
           itemsLength={items.length}
@@ -81,7 +88,10 @@ function Counter({
   return (
     <Badge
       size="2xs"
-      className={cn('flex items-center gap-1 h-full', className)}
+      className={cn(
+        'flex items-center gap-1 h-full bg-filterable-list-counter-background text-filterable-list-counter-foreground',
+        className,
+      )}
     >
       {itemsLength !== filteredItemsLength && (
         <>

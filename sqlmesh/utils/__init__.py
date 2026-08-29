@@ -21,6 +21,7 @@ from enum import IntEnum, Enum
 from functools import lru_cache, reduce, wraps
 from pathlib import Path
 
+import unicodedata
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialects
 
@@ -245,9 +246,7 @@ def ttl_cache(ttl: int = 60, maxsize: int = 128000) -> t.Callable:
 
 
 class classproperty(property):
-    """
-    Similar to a normal property but works for class methods
-    """
+    """Similar to a normal property but works for class methods"""
 
     def __get__(self, obj: t.Any, owner: t.Any = None) -> t.Any:
         return classmethod(self.fget).__get__(None, owner)()  # type: ignore
@@ -291,8 +290,14 @@ def sqlglot_dialects() -> str:
 
 NON_ALNUM = re.compile(r"[^a-zA-Z0-9_]")
 
+NON_ALUM_INCLUDE_UNICODE = re.compile(r"\W", flags=re.UNICODE)
 
-def sanitize_name(name: str) -> str:
+
+def sanitize_name(name: str, *, include_unicode: bool = False) -> str:
+    if include_unicode:
+        s = unicodedata.normalize("NFC", name)
+        s = NON_ALUM_INCLUDE_UNICODE.sub("_", s)
+        return s
     return NON_ALNUM.sub("_", name)
 
 
@@ -403,6 +408,10 @@ class CorrelationId:
     @classmethod
     def from_plan_id(cls, plan_id: str) -> CorrelationId:
         return CorrelationId(JobType.PLAN, plan_id)
+
+    @classmethod
+    def from_run_id(cls, run_id: str) -> CorrelationId:
+        return CorrelationId(JobType.RUN, run_id)
 
 
 def get_source_columns_to_types(

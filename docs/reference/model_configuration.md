@@ -178,6 +178,7 @@ The SQLMesh project-level `model_defaults` key supports the following options, d
 - kind
 - dialect
 - cron
+- cron_tz
 - owner
 - start
 - table_format
@@ -192,9 +193,14 @@ The SQLMesh project-level `model_defaults` key supports the following options, d
 - allow_partials
 - enabled
 - interval_unit
+- gateway
 - pre_statements (described [here](../concepts/models/sql_models.md#pre--and-post-statements))
 - post_statements (described [here](../concepts/models/sql_models.md#pre--and-post-statements))
 - on_virtual_update (described [here](../concepts/models/sql_models.md#on-virtual-update-statements))
+
+The `gateway` default applies to managed SQL, Python, and seed models. It does not apply to
+external models because an external model's `gateway` selects a gateway-specific source
+definition. Set that gateway explicitly in `external_models.yaml` when needed.
 
 
 ### Model Naming
@@ -282,7 +288,7 @@ Configuration options for [`SCD_TYPE_2` models](../concepts/models/model_kinds.m
 | `unique_key`              | The model column(s) containing each row's unique key                                                                                                                                        | array[str] |    Y     |
 | `valid_from_name`         | The model column containing each row's valid from date. (Default: `valid_from`)                                                                                                             |    str     |    N     |
 | `valid_to_name`           | The model column containing each row's valid to date. (Default: `valid_to`)                                                                                                                 |    str     |    N     |
-| `invalidate_hard_deletes` | If set to true, when a record is missing from the source table it will be marked as invalid - see [here](../concepts/models/model_kinds.md#deletes) for more information. (Default: `True`) |    bool    |    N     |
+| `invalidate_hard_deletes` | If set to true, when a record is missing from the source table it will be marked as invalid - see [here](../concepts/models/model_kinds.md#deletes) for more information. (Default: `False`) |    bool    |    N     |
 
 ##### SCD Type 2 By Time
 

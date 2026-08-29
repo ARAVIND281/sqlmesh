@@ -36,6 +36,7 @@ from sqlmesh.core.config.naming import NameInferenceConfig as NameInferenceConfi
 from sqlmesh.core.config.linter import LinterConfig as LinterConfig
 from sqlmesh.core.config.plan import PlanConfig
 from sqlmesh.core.config.run import RunConfig
+from sqlmesh.core.config.dbt import DbtConfig
 from sqlmesh.core.config.scheduler import (
     BuiltInSchedulerConfig,
     SchedulerConfig,
@@ -73,6 +74,24 @@ def gateways_ensure_dict(value: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
 
 def validate_regex_key_dict(value: t.Dict[str | re.Pattern, t.Any]) -> t.Dict[re.Pattern, t.Any]:
     return compile_regex_mapping(value)
+
+
+def _canonicalize(obj: object) -> object:
+    """Recursively convert an object into a canonical, order-stable form for hashing.
+
+    ``set``/``frozenset`` iteration order is not stable across Python processes, so
+    pickling them directly yields non-deterministic bytes. That makes any hash derived
+    from the pickle (e.g. ``Config.fingerprint``) change run-to-run, which silently
+    invalidates on-disk caches keyed by the fingerprint. Sorting set members into a
+    list restores determinism while preserving contents.
+    """
+    if isinstance(obj, (set, frozenset)):
+        return sorted(map(_canonicalize, obj))  # type: ignore[type-var]
+    if isinstance(obj, dict):
+        return {k: _canonicalize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(map(_canonicalize, obj))
+    return obj
 
 
 if t.TYPE_CHECKING:
@@ -173,6 +192,7 @@ class Config(BaseConfig):
     linter: LinterConfig = LinterConfig()
     janitor: JanitorConfig = JanitorConfig()
     cache_dir: t.Optional[str] = None
+    dbt: t.Optional[DbtConfig] = None
 
     _FIELD_UPDATE_STRATEGY: t.ClassVar[t.Dict[str, UpdateStrategy]] = {
         "gateways": UpdateStrategy.NESTED_UPDATE,
@@ -191,6 +211,7 @@ class Config(BaseConfig):
         "before_all": UpdateStrategy.EXTEND,
         "after_all": UpdateStrategy.EXTEND,
         "linter": UpdateStrategy.NESTED_UPDATE,
+        "dbt": UpdateStrategy.NESTED_UPDATE,
     }
 
     _connection_config_validator = connection_config_validator
@@ -361,4 +382,8 @@ class Config(BaseConfig):
 
     @property
     def fingerprint(self) -> str:
-        return str(zlib.crc32(pickle.dumps(self.dict(exclude={"loader", "notification_targets"}))))
+        return str(
+            zlib.crc32(
+                pickle.dumps(_canonicalize(self.dict(exclude={"loader", "notification_targets"})))
+            )
+        )

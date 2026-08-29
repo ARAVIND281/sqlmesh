@@ -1,13 +1,11 @@
-import { cn } from '@/utils'
+import { cn } from '@sqlmesh-common/utils'
 
-export function Tagline({
-  className,
-  children,
-  ...props
-}: {
+export interface TaglineProps {
   className?: string
   children?: React.ReactNode
-}) {
+}
+
+export function Tagline({ className, children, ...props }: TaglineProps) {
   return (
     <div
       data-component="Tagline"

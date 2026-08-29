@@ -9,24 +9,20 @@ from sqlglot import exp
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_result
 from sqlmesh.core.engine_adapter.mssql import MSSQLEngineAdapter
 from sqlmesh.core.engine_adapter.shared import (
+    CommentCreationTable,
+    CommentCreationView,
     InsertOverwriteStrategy,
-    SourceQuery,
 )
-from sqlmesh.core.engine_adapter.base import EngineAdapter
 from sqlmesh.utils.errors import SQLMeshError
 from sqlmesh.utils.connection_pool import ConnectionPool
+from sqlmesh.core.schema_diff import TableAlterOperation
+from sqlmesh.utils import random_id
 
-
-if t.TYPE_CHECKING:
-    from sqlmesh.core._typing import TableName
-
-
-from sqlmesh.core.engine_adapter.mixins import LogicalMergeMixin
 
 logger = logging.getLogger(__name__)
 
 
-class FabricEngineAdapter(LogicalMergeMixin, MSSQLEngineAdapter):
+class FabricEngineAdapter(MSSQLEngineAdapter):
     """
     Adapter for Microsoft Fabric.
     """
@@ -36,6 +32,10 @@ class FabricEngineAdapter(LogicalMergeMixin, MSSQLEngineAdapter):
     SUPPORTS_TRANSACTIONS = False
     SUPPORTS_CREATE_DROP_CATALOG = True
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
+    # There is no standard method to handle comments in Fabric for now, so we disable it.
+    # Otherwise, it would be inherited from MSSQL and would not work.
+    COMMENT_CREATION_TABLE = CommentCreationTable.UNSUPPORTED
+    COMMENT_CREATION_VIEW = CommentCreationView.UNSUPPORTED
 
     def __init__(
         self, connection_factory_or_pool: t.Union[t.Callable, t.Any], *args: t.Any, **kwargs: t.Any
@@ -58,24 +58,31 @@ class FabricEngineAdapter(LogicalMergeMixin, MSSQLEngineAdapter):
     def _target_catalog(self, value: t.Optional[str]) -> None:
         self._connection_pool.set_attribute("target_catalog", value)
 
-    def _insert_overwrite_by_condition(
-        self,
-        table_name: TableName,
-        source_queries: t.List[SourceQuery],
-        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
-        where: t.Optional[exp.Condition] = None,
-        insert_overwrite_strategy_override: t.Optional[InsertOverwriteStrategy] = None,
-        **kwargs: t.Any,
-    ) -> None:
-        # Override to avoid MERGE statement which isn't fully supported in Fabric
-        return EngineAdapter._insert_overwrite_by_condition(
-            self,
-            table_name=table_name,
-            source_queries=source_queries,
-            target_columns_to_types=target_columns_to_types,
-            where=where,
-            insert_overwrite_strategy_override=InsertOverwriteStrategy.DELETE_INSERT,
-            **kwargs,
+    @property
+    def _connected_catalog(self) -> t.Optional[str]:
+        """Catalog the currently-open thread-local connection is actually using."""
+        return self._connection_pool.get_attribute("connected_catalog")
+
+    @_connected_catalog.setter
+    def _connected_catalog(self, value: t.Optional[str]) -> None:
+        self._connection_pool.set_attribute("connected_catalog", value)
+
+    def _normalize_catalog(self, catalog_name: t.Optional[str]) -> t.Optional[str]:
+        if not catalog_name:
+            return None
+
+        default_catalog = self._default_catalog or self._extra_config.get("database")
+        if default_catalog and catalog_name == default_catalog:
+            return None
+
+        return catalog_name
+
+    def _catalog_state_label(self, catalog_name: t.Optional[str]) -> str:
+        return (
+            catalog_name
+            or self._default_catalog
+            or self._extra_config.get("database")
+            or "<default>"
         )
 
     @property
@@ -121,20 +128,28 @@ class FabricEngineAdapter(LogicalMergeMixin, MSSQLEngineAdapter):
     def _drop_catalog(self, catalog_name: exp.Identifier) -> None:
         """Drop a catalog (warehouse) in Microsoft Fabric via REST API."""
         warehouse_name = catalog_name.sql(dialect=self.dialect, identify=False)
-        current_catalog = self.get_current_catalog()
 
         logger.info(f"Deleting Fabric warehouse: {warehouse_name}")
         self.api_client.delete_warehouse(warehouse_name)
 
-        if warehouse_name == current_catalog:
-            # Somewhere around 2025-09-08, Fabric started validating the "Database=" connection argument and throwing 'Authentication failed' if the database doesnt exist
-            # In addition, set_current_catalog() is implemented using a threadlocal variable "target_catalog"
-            # So, when we drop a warehouse, and there are still threads with "target_catalog" set to reference it, any operations on those threads
-            # that use an either use an existing connection pointing to this warehouse or trigger a new connection
-            # will fail with an 'Authentication Failed' error unless we close all connections here, which also clears all the threadlocal data
+        # Close all connections if any thread may be using the dropped warehouse.
+        # We must check both the logical target and the physical connection catalog
+        # (falling back to the configured default when either is neutral) because
+        # Fabric validates the DATABASE= connection argument and raises
+        # 'Authentication Failed' when it points at a non-existent warehouse.
+        default_db = self._extra_config.get("database")
+        in_use = {
+            self.get_current_catalog() or default_db,
+            self._normalize_catalog(self._connected_catalog) or default_db,
+        }
+        if warehouse_name in in_use:
             self.close()
 
-    def set_current_catalog(self, catalog_name: str) -> None:
+    def get_current_catalog(self) -> t.Optional[str]:
+        """Return the explicit Fabric catalog target for the current thread."""
+        return self._normalize_catalog(self._target_catalog)
+
+    def set_current_catalog(self, catalog_name: t.Optional[str]) -> None:
         """
         Set the current catalog for Microsoft Fabric connections.
 
@@ -143,7 +158,8 @@ class FabricEngineAdapter(LogicalMergeMixin, MSSQLEngineAdapter):
         recreate them with the new catalog in the connection configuration.
 
         Args:
-            catalog_name: The name of the catalog (warehouse) to switch to
+            catalog_name: The name of the catalog (warehouse) to switch to.
+                The configured default catalog is treated as the neutral state.
 
         Note:
             Fabric doesn't support catalog switching via USE statements because each
@@ -153,33 +169,167 @@ class FabricEngineAdapter(LogicalMergeMixin, MSSQLEngineAdapter):
         See:
             https://learn.microsoft.com/en-us/fabric/data-warehouse/sql-query-editor#limitations
         """
-        current_catalog = self.get_current_catalog()
+        target_catalog = self._normalize_catalog(catalog_name)
+        explicit_default_catalog = catalog_name is not None and target_catalog is None
+        connected_catalog = self._normalize_catalog(self._connected_catalog)
 
-        # If already using the requested catalog, do nothing
-        if current_catalog and current_catalog == catalog_name:
-            logger.debug(f"Already using catalog '{catalog_name}', no action needed")
+        # An explicit request for the default catalog must also match the catalog
+        # used by the open connection. A lazy restore with None only updates the
+        # logical target and intentionally leaves that connection in place.
+        if self.get_current_catalog() == target_catalog and (
+            not explicit_default_catalog or connected_catalog is None
+        ):
+            logger.debug("Already using requested Fabric catalog state, no action needed")
             return
 
-        logger.info(f"Switching from catalog '{current_catalog}' to '{catalog_name}'")
+        # Decide whether the open connection needs to be replaced.
+        #
+        # The set_catalog decorator restores the previous catalog (often None)
+        # after every catalog-scoped call.  For Fabric, a connection close +
+        # reopen is expensive because each new connection goes through ODBC and
+        # the Fabric gateway.  We therefore apply lazy connection management:
+        #
+        #  * When restoring to neutral (target=None): just update _target_catalog.
+        #    The existing connection stays alive and will be reused or replaced
+        #    on the next real switch, avoiding a pointless bounce through the
+        #    default catalog.
+        #
+        #  * When switching to a non-neutral catalog: only close/reopen if the
+        #    open connection is already on a different catalog.  If a previous
+        #    restore-to-neutral left the connection on the right catalog, we
+        #    skip the close entirely.
+        needs_reconnect = (target_catalog is not None or explicit_default_catalog) and (
+            connected_catalog != target_catalog
+        )
 
-        # commit the transaction before closing the connection to help prevent errors like:
-        # > Snapshot isolation transaction failed in database because the object accessed by the statement has been modified by a
-        # > DDL statement in another concurrent transaction since the start of this transaction
-        # on subsequent queries in the new connection
-        self._connection_pool.commit()
-
-        # note: we call close() on the connection pool instead of self.close() because self.close() calls close_all()
-        # on the connection pool but we just want to close the connection for this thread
-        self._connection_pool.close()
-        self._target_catalog = catalog_name  # new connections will use this catalog
-
-        catalog_after_switch = self.get_current_catalog()
-
-        if catalog_after_switch != catalog_name:
-            # We need to raise an error if the catalog switch failed to prevent the operation that needed the catalog switch from being run against the wrong catalog
-            raise SQLMeshError(
-                f"Unable to switch catalog to {catalog_name}, catalog ended up as {catalog_after_switch}"
+        if needs_reconnect:
+            logger.info(
+                "Switching connection from catalog '%s' to '%s'",
+                self._catalog_state_label(connected_catalog),
+                self._catalog_state_label(target_catalog),
             )
+            # Commit before closing to avoid snapshot-isolation errors on
+            # subsequent queries in the new connection.
+            self._connection_pool.commit()
+            # note: close() on the pool (not self.close()) to only affect this
+            # thread's connection rather than all threads.
+            self._connection_pool.close()
+            self._connected_catalog = target_catalog
+        else:
+            logger.debug(
+                "Updating catalog target to '%s' (connection remains on '%s')",
+                self._catalog_state_label(target_catalog),
+                self._catalog_state_label(connected_catalog),
+            )
+
+        self._target_catalog = target_catalog
+
+    def alter_table(
+        self, alter_expressions: t.Union[t.List[exp.Alter], t.List[TableAlterOperation]]
+    ) -> None:
+        """
+        Applies alter expressions to a table. Fabric has limited support for ALTER TABLE,
+        so this method implements a workaround for column type changes.
+        This method is self-contained and sets its own catalog context.
+        """
+        if not alter_expressions:
+            return
+
+        # Get the target table from the first expression to determine the correct catalog.
+        first_op = alter_expressions[0]
+        expression = first_op.expression if isinstance(first_op, TableAlterOperation) else first_op
+        if not isinstance(expression, exp.Alter) or not expression.this.catalog:
+            # Fallback for unexpected scenarios
+            logger.warning(
+                "Could not determine catalog from alter expression, executing with current context."
+            )
+            super().alter_table(alter_expressions)
+            return
+
+        target_catalog = expression.this.catalog
+        self.set_current_catalog(target_catalog)
+
+        with self.transaction():
+            for op in alter_expressions:
+                expression = op.expression if isinstance(op, TableAlterOperation) else op
+
+                if not isinstance(expression, exp.Alter):
+                    self.execute(expression)
+                    continue
+
+                for action in expression.actions:
+                    table_name = expression.this
+
+                    table_name_without_catalog = table_name.copy()
+                    table_name_without_catalog.set("catalog", None)
+
+                    is_type_change = isinstance(action, exp.AlterColumn) and action.args.get(
+                        "dtype"
+                    )
+
+                    if is_type_change:
+                        column_to_alter = action.this
+                        new_type = action.args["dtype"]
+                        temp_column_name_str = f"{column_to_alter.name}__{random_id(short=True)}"
+                        temp_column_name = exp.to_identifier(temp_column_name_str)
+
+                        logger.info(
+                            "Applying workaround for column '%s' on table '%s' to change type to '%s'.",
+                            column_to_alter.sql(),
+                            table_name.sql(),
+                            new_type.sql(),
+                        )
+
+                        # Step 1: Add a temporary column.
+                        add_column_expr = exp.Alter(
+                            this=table_name_without_catalog.copy(),
+                            kind="TABLE",
+                            actions=[
+                                exp.ColumnDef(this=temp_column_name.copy(), kind=new_type.copy())
+                            ],
+                        )
+                        add_sql = self._to_sql(add_column_expr)
+                        self.execute(add_sql)
+
+                        # Step 2: Copy and cast data.
+                        update_sql = self._to_sql(
+                            exp.Update(
+                                this=table_name_without_catalog.copy(),
+                                expressions=[
+                                    exp.EQ(
+                                        this=temp_column_name.copy(),
+                                        expression=exp.Cast(
+                                            this=column_to_alter.copy(), to=new_type.copy()
+                                        ),
+                                    )
+                                ],
+                            )
+                        )
+                        self.execute(update_sql)
+
+                        # Step 3: Drop the original column.
+                        drop_sql = self._to_sql(
+                            exp.Alter(
+                                this=table_name_without_catalog.copy(),
+                                kind="TABLE",
+                                actions=[exp.Drop(this=column_to_alter.copy(), kind="COLUMN")],
+                            )
+                        )
+                        self.execute(drop_sql)
+
+                        # Step 4: Rename the temporary column.
+                        old_name_qualified = f"{table_name_without_catalog.sql(dialect=self.dialect)}.{temp_column_name.sql(dialect=self.dialect)}"
+                        new_name_unquoted = column_to_alter.sql(
+                            dialect=self.dialect, identify=False
+                        )
+                        rename_sql = f"EXEC sp_rename '{old_name_qualified}', '{new_name_unquoted}', 'COLUMN'"
+                        self.execute(rename_sql)
+                    else:
+                        # For other alterations, execute directly.
+                        direct_alter_expr = exp.Alter(
+                            this=table_name_without_catalog.copy(), kind="TABLE", actions=[action]
+                        )
+                        self.execute(direct_alter_expr)
 
 
 class FabricHttpClient:

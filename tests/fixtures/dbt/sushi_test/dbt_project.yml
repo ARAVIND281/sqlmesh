@@ -50,6 +50,7 @@ vars:
 
   yet_another_var: 1
   dynamic_test_var: 3
+  some_var: 'should be overridden in customers package'
 
   customers:
     some_var: ["foo", "bar"]
@@ -64,6 +65,9 @@ vars:
       value: 1
     - name: 'item2'
       value: 2
+
+  # Despite this being an invalid variable definition, dbt doesn't mind if it's unused
+  invalid_var: "{{ ref('ref_without_closing_paren' }}"
 
 
 on-run-start:

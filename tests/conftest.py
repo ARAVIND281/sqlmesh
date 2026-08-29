@@ -202,7 +202,15 @@ class SushiDataValidator:
 
 
 def pytest_collection_modifyitems(items, *args, **kwargs):
-    test_type_markers = {"fast", "slow", "docker", "remote", "isolated", "registry_isolation"}
+    test_type_markers = {
+        "fast",
+        "slow",
+        "docker",
+        "remote",
+        "isolated",
+        "registry_isolation",
+        "dialect_isolated",
+    }
     for item in items:
         for marker in item.iter_markers():
             if marker.name in test_type_markers:
@@ -239,7 +247,7 @@ def rescope_duckdb_classvar(request):
     yield
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="function", autouse=True)
 def rescope_log_handlers():
     logging.getLogger().handlers.clear()
     yield
@@ -253,9 +261,12 @@ def rescope_lineage_cache(request):
 
 @pytest.fixture(autouse=True)
 def reset_console():
-    from sqlmesh.core.console import set_console, NoopConsole
+    from sqlmesh.core.console import set_console, NoopConsole, get_console
 
+    orig_console = get_console()
     set_console(NoopConsole())
+    yield
+    set_console(orig_console)
 
 
 @pytest.fixture
@@ -370,7 +381,7 @@ def init_and_plan_context(copy_to_temp_path, mocker) -> t.Callable:
 @pytest.fixture
 def assert_exp_eq() -> t.Callable:
     def _assert_exp_eq(
-        source: exp.Expression | str, expected: exp.Expression | str, dialect: DialectType = None
+        source: exp.Expr | str, expected: exp.Expr | str, dialect: DialectType = None
     ) -> None:
         source_exp = maybe_parse(source, dialect=dialect)
         expected_exp = maybe_parse(expected, dialect=dialect)
@@ -560,7 +571,7 @@ def copy_to_temp_path(tmp_path: Path) -> t.Callable:
         return [name for name in names if name == ".cache"]
 
     def _make_function(
-        paths: t.Union[t.Union[str, Path], t.Collection[t.Union[str, Path]]],
+        paths: t.Union[str, Path, t.List[t.Union[str, Path]], t.Tuple[t.Union[str, Path], ...]],
     ) -> t.List[Path]:
         paths = ensure_list(paths)
         all_paths = [Path(p) for p in paths]
@@ -572,7 +583,19 @@ def copy_to_temp_path(tmp_path: Path) -> t.Callable:
                 # shutil.copytree just doesnt work properly with the symlinks on Windows, regardless of the `symlinks` setting
                 src = str(path.absolute())
                 dst = str(temp_dir.absolute())
-                os.system(f"robocopy {src} {dst} /E /COPYALL")
+
+                # Robocopy flag reference: https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/robocopy#copy-options
+                # /E:      Copy subdirectories, including empty directories
+                # /COPY:D  Copy "data" only. In particular, this avoids copying auditing information, which can throw
+                #          an error like "ERROR : You do not have the Manage Auditing user right"
+                robocopy_cmd = f"robocopy {src} {dst} /E /COPY:D"
+                exit_code = os.system(robocopy_cmd)
+
+                # exit code reference: https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/robocopy#exit-return-codes
+                if exit_code > 8:
+                    raise Exception(
+                        f"robocopy command: '{robocopy_cmd}' failed with exit code: {exit_code}"
+                    )
 
                 # after copying, delete the files that would have been ignored
                 for root, dirs, _ in os.walk(temp_dir):

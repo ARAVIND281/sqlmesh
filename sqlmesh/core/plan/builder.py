@@ -65,6 +65,9 @@ class PlanBuilder:
         restate_models: A list of models for which the data should be restated for the time range
             specified in this plan. Note: models defined outside SQLMesh (external) won't be a part
             of the restatement.
+        restate_all_snapshots: If restatements are present, this flag indicates whether or not the intervals
+            being restated should be cleared from state for other versions of this model (typically, versions that are present in other environments).
+            If set to None, the default behaviour is to not clear anything unless the target environment is prod.
         backfill_models: A list of fully qualified model names for which the data should be backfilled as part of this plan.
         no_gaps:  Whether to ensure that new snapshots for nodes that are already a
             part of the target environment have no data gaps when compared against previous
@@ -84,6 +87,8 @@ class PlanBuilder:
         default_start: The default plan start to use if not specified.
         default_end: The default plan end to use if not specified.
         enable_preview: Whether to enable preview for forward-only models in development environments.
+        preview_start: The start time to use for forward-only previews. Defaults to the plan start.
+        preview_min_intervals: The minimum number of intervals to preview for each forward-only preview snapshot.
         end_bounded: If set to true, the missing intervals will be bounded by the target end date, disregarding lookback,
             allow_partials, and other attributes that could cause the intervals to exceed the target end date.
         ensure_finalized_snapshots: Whether to compare against snapshots from the latest finalized
@@ -103,6 +108,7 @@ class PlanBuilder:
         execution_time: t.Optional[TimeLike] = None,
         apply: t.Optional[t.Callable[[Plan], None]] = None,
         restate_models: t.Optional[t.Iterable[str]] = None,
+        restate_all_snapshots: bool = False,
         backfill_models: t.Optional[t.Iterable[str]] = None,
         no_gaps: bool = False,
         skip_backfill: bool = False,
@@ -121,6 +127,8 @@ class PlanBuilder:
         default_start: t.Optional[TimeLike] = None,
         default_end: t.Optional[TimeLike] = None,
         enable_preview: bool = False,
+        preview_start: t.Optional[TimeLike] = None,
+        preview_min_intervals: int = 0,
         end_bounded: bool = False,
         ensure_finalized_snapshots: bool = False,
         explain: bool = False,
@@ -144,6 +152,9 @@ class PlanBuilder:
             allow_additive_models if allow_additive_models is not None else []
         )
         self._enable_preview = enable_preview
+        self._preview_start_provided = preview_start is not None
+        self._preview_start = preview_start
+        self._preview_min_intervals = preview_min_intervals
         self._end_bounded = end_bounded
         self._ensure_finalized_snapshots = ensure_finalized_snapshots
         self._ignore_cron = ignore_cron
@@ -154,13 +165,14 @@ class PlanBuilder:
         self._auto_categorization_enabled = auto_categorization_enabled
         self._include_unmodified = include_unmodified
         self._restate_models = set(restate_models) if restate_models is not None else None
+        self._restate_all_snapshots = restate_all_snapshots
         self._effective_from = effective_from
 
         # note: this deliberately doesnt default to now() here.
         # There may be an significant delay between the PlanBuilder producing a Plan and the Plan actually being run
         # so if execution_time=None is passed to the PlanBuilder, then the resulting Plan should also have execution_time=None
         # in order to prevent the Plan that was intended to run "as at now" from having "now" fixed to some time in the past
-        # ref: https://github.com/TobikoData/sqlmesh/pull/4702#discussion_r2140696156
+        # ref: https://github.com/SQLMesh/sqlmesh/pull/4702#discussion_r2140696156
         self._execution_time = execution_time
 
         self._backfill_models = backfill_models
@@ -174,9 +186,17 @@ class PlanBuilder:
         self._explain = explain
 
         self._start = start
-        if not self._start and (
-            self._forward_only_preview_needed or self._non_forward_only_preview_needed
-        ):
+        if not self._start and self._forward_only_preview_needed:
+            self._preview_start = self._preview_start or default_start or yesterday_ds()
+            # If a separate preview start was provided, don't let it shorten the
+            # plan start for regular backfills. Fallback preview starts preserve
+            # the previous preview behavior of using default_start or yesterday.
+            if self._preview_start_provided and not self._skip_backfill:
+                self._start = default_start or yesterday_ds()
+            else:
+                self._start = self._preview_start
+
+        if not self._start and self._non_forward_only_preview_needed:
             self._start = default_start or yesterday_ds()
 
         self._plan_id: str = random_id()
@@ -221,6 +241,8 @@ class PlanBuilder:
 
     def set_start(self, new_start: TimeLike) -> PlanBuilder:
         self._start = new_start
+        if not self._preview_start_provided and self._forward_only_preview_needed:
+            self._preview_start = new_start
         self.override_start = True
         self._latest_plan = None
         return self
@@ -242,6 +264,8 @@ class PlanBuilder:
         self._effective_from = effective_from
         if effective_from and self._is_dev and not self.override_start:
             self._start = effective_from
+            if not self._preview_start_provided and self._forward_only_preview_needed:
+                self._preview_start = effective_from
         self._latest_plan = None
         return self
 
@@ -277,7 +301,6 @@ class PlanBuilder:
         if self._latest_plan:
             return self._latest_plan
 
-        self._ensure_no_new_snapshots_with_restatements()
         self._ensure_new_env_with_changes()
         self._ensure_valid_date_range()
         self._ensure_no_broken_references()
@@ -338,7 +361,9 @@ class PlanBuilder:
             directly_modified=directly_modified,
             indirectly_modified=indirectly_modified,
             deployability_index=deployability_index,
+            selected_models_to_restate=self._restate_models,
             restatements=restatements,
+            restate_all_snapshots=self._restate_all_snapshots,
             start_override_per_model=self._start_override_per_model,
             end_override_per_model=end_override_per_model,
             selected_models_to_backfill=self._backfill_models,
@@ -441,9 +466,12 @@ class PlanBuilder:
             possible_intervals = {
                 restatements[p.snapshot_id] for p in restating_parents if p.is_incremental
             }
+            removal_start = (
+                self._forward_only_preview_start(snapshot, start, end) if is_preview else start
+            )
             possible_intervals.add(
                 snapshot.get_removal_interval(
-                    start,
+                    removal_start,
                     end,
                     self._execution_time,
                     strict=False,
@@ -467,6 +495,21 @@ class PlanBuilder:
             restatements[s_id] = (snapshot_start, snapshot_end)
 
         return restatements
+
+    def _forward_only_preview_start(
+        self, snapshot: Snapshot, default_start: TimeLike, end: TimeLike
+    ) -> TimeLike:
+        preview_start = self._preview_start or default_start
+        if not self._preview_min_intervals:
+            return preview_start
+
+        relative_base = to_datetime(self.execution_time)
+        preview_end = to_datetime(end, relative_base=relative_base)
+        min_start = snapshot.node.cron_floor(preview_end)
+        for _ in range(self._preview_min_intervals):
+            min_start = snapshot.node.cron_prev(min_start)
+
+        return min(to_datetime(preview_start, relative_base=relative_base), min_start)
 
     def _build_directly_and_indirectly_modified(
         self, dag: DAG[SnapshotId]
@@ -674,6 +717,14 @@ class PlanBuilder:
                     if mode == AutoCategorizationMode.FULL:
                         snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only)
         elif self._context_diff.indirectly_modified(snapshot.name):
+            if snapshot.is_materialized_view and not forward_only:
+                # We categorize changes as breaking to allow for instantaneous switches in a virtual layer.
+                # Otherwise, there might be a potentially long downtime during MVs recreation.
+                # In the case of forward-only changes this optimization is not applicable because we want to continue
+                # using the same (existing) table version.
+                snapshot.categorize_as(SnapshotChangeCategory.INDIRECT_BREAKING, forward_only)
+                return
+
             all_upstream_forward_only = set()
             all_upstream_categories = set()
             direct_parent_categories = set()
@@ -857,15 +908,6 @@ class PlanBuilder:
                 raise PlanError(
                     f"""Removed {broken_references_msg} are referenced in '{snapshot.name}'. Please remove broken references before proceeding."""
                 )
-
-    def _ensure_no_new_snapshots_with_restatements(self) -> None:
-        if self._restate_models is not None and (
-            self._context_diff.new_snapshots or self._context_diff.modified_snapshots
-        ):
-            raise PlanError(
-                "Model changes and restatements can't be a part of the same plan. "
-                "Revert or apply changes before proceeding with restatements."
-            )
 
     def _ensure_new_env_with_changes(self) -> None:
         if (

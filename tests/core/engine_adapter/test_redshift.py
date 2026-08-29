@@ -8,8 +8,11 @@ from unittest.mock import PropertyMock
 from sqlglot import expressions as exp
 from sqlglot import parse_one
 
+import sqlmesh.core.dialect as d
 from sqlmesh.core.engine_adapter import RedshiftEngineAdapter
-from sqlmesh.core.engine_adapter.shared import DataObject
+from sqlmesh.core.engine_adapter.shared import DataObject, DataObjectType
+from sqlmesh.core.model import load_sql_based_model
+from sqlmesh.core.model.definition import SqlModel
 from sqlmesh.utils.errors import SQLMeshError
 from tests.core.engine_adapter import to_sql_calls
 
@@ -30,6 +33,158 @@ def test_columns(adapter: t.Callable):
         """SELECT "column_name", "data_type", "character_maximum_length", "numeric_precision", "numeric_scale" FROM "svv_columns" WHERE "table_name" = 'table' AND "table_schema" = 'db'"""
     )
     assert resp == {"col": exp.DataType.build("INT")}
+
+
+def test_create_table_physical_properties(make_mocked_engine_adapter: t.Callable):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+
+    adapter.create_table(
+        "test_schema.test_table",
+        {
+            "id_file": exp.DataType.build("INT"),
+            "batch_time": exp.DataType.build("TIMESTAMP"),
+        },
+        table_properties={
+            "diststyle": exp.column("key"),
+            "distkey": exp.to_column("id_file"),
+            "sortkey": exp.to_column("batch_time"),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE TABLE IF NOT EXISTS "test_schema"."test_table" ("id_file" INTEGER, "batch_time" TIMESTAMP) DISTSTYLE KEY DISTKEY("id_file") SORTKEY("batch_time")',
+    ]
+
+
+@pytest.mark.parametrize(
+    ("diststyle", "expected"),
+    [
+        ("auto", "AUTO"),
+        ("even", "EVEN"),
+        ("key", "KEY"),
+        ("all", "ALL"),
+    ],
+)
+def test_create_table_physical_properties_diststyle_values(
+    make_mocked_engine_adapter: t.Callable,
+    diststyle: str,
+    expected: str,
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    table_properties = {"diststyle": exp.column(diststyle)}
+    if diststyle == "key":
+        table_properties["distkey"] = exp.to_column("id_file")
+
+    adapter.create_table(
+        "test_schema.test_table",
+        {"id_file": exp.DataType.build("INT")},
+        table_properties=table_properties,
+    )
+
+    expected_distkey = ' DISTKEY("id_file")' if diststyle == "key" else ""
+    assert to_sql_calls(adapter) == [
+        f'CREATE TABLE IF NOT EXISTS "test_schema"."test_table" ("id_file" INTEGER) DISTSTYLE {expected}{expected_distkey}',
+    ]
+
+
+def test_create_table_physical_properties_distkey_without_diststyle(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+
+    adapter.create_table(
+        "test_schema.test_table",
+        {"id_file": exp.DataType.build("INT")},
+        table_properties={"distkey": exp.to_column("id_file")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE TABLE IF NOT EXISTS "test_schema"."test_table" ("id_file" INTEGER) DISTKEY("id_file")',
+    ]
+
+
+def test_create_table_physical_properties_multi_column_sortkey(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+
+    adapter.create_table(
+        "test_schema.test_table",
+        {
+            "id_file": exp.DataType.build("INT"),
+            "batch_time": exp.DataType.build("TIMESTAMP"),
+            "event_time": exp.DataType.build("TIMESTAMP"),
+        },
+        table_properties={
+            "diststyle": exp.column("key"),
+            "distkey": exp.to_column("id_file"),
+            "sortkey": exp.Tuple(
+                expressions=[exp.to_column("batch_time"), exp.to_column("event_time")]
+            ),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE TABLE IF NOT EXISTS "test_schema"."test_table" ("id_file" INTEGER, "batch_time" TIMESTAMP, "event_time" TIMESTAMP) DISTSTYLE KEY DISTKEY("id_file") SORTKEY("batch_time", "event_time")',
+    ]
+
+
+def test_create_table_physical_properties_with_string_columns(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+
+    adapter.create_table(
+        "test_schema.test_table",
+        {
+            "id_file": exp.DataType.build("INT"),
+            "batch_time": exp.DataType.build("TIMESTAMP"),
+        },
+        table_properties={
+            "diststyle": exp.Literal.string("key"),
+            "distkey": exp.Literal.string("id_file"),
+            "sortkey": exp.Literal.string("batch_time"),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE TABLE IF NOT EXISTS "test_schema"."test_table" ("id_file" INTEGER, "batch_time" TIMESTAMP) DISTSTYLE KEY DISTKEY("id_file") SORTKEY("batch_time")',
+    ]
+
+
+def test_create_table_physical_properties_from_model_definition(
+    make_mocked_engine_adapter: t.Callable,
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    model: SqlModel = t.cast(
+        SqlModel,
+        load_sql_based_model(
+            d.parse(
+                """
+MODEL (
+    name test_schema.test_table,
+    kind full,
+    physical_properties (
+        diststyle = key,
+        distkey = "id_file",
+        sortkey = "batch_time"
+    )
+);
+SELECT id_file::INT, batch_time::TIMESTAMP;
+    """
+            )
+        ),
+    )
+
+    adapter.create_table(
+        model.name,
+        target_columns_to_types=model.columns_to_types_or_raise,
+        table_properties=model.physical_properties,
+    )
+
+    assert to_sql_calls(adapter) == [
+        'CREATE TABLE IF NOT EXISTS "test_schema"."test_table" ("id_file" INTEGER, "batch_time" TIMESTAMP) DISTSTYLE KEY DISTKEY("id_file") SORTKEY("batch_time")',
+    ]
 
 
 def test_varchar_size_workaround(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
@@ -81,6 +236,154 @@ def test_varchar_size_workaround(make_mocked_engine_adapter: t.Callable, mocker:
         'DROP VIEW IF EXISTS "__temp_ctas_test_random_id" CASCADE',
         'CREATE TABLE "test_schema"."test_table" ("char" CHAR, "char1" CHAR(max), "char2" CHAR(2), "varchar" VARCHAR, "varchar256" VARCHAR(max), "varchar2" VARCHAR(2))',
     ]
+
+
+def test_sync_grants_config(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    relation = exp.to_table("test_schema.test_table", dialect="redshift")
+    new_grants_config = {"SELECT": ["user1", "user2"], "INSERT": ["user3"]}
+
+    current_grants = [("SELECT", "old_user"), ("UPDATE", "legacy_user")]
+    fetchall_mock = mocker.patch.object(adapter, "fetchall", return_value=current_grants)
+
+    adapter.sync_grants_config(relation, new_grants_config)
+
+    fetchall_mock.assert_called_once()
+    executed_query = fetchall_mock.call_args[0][0]
+    executed_sql = executed_query.sql(dialect="redshift")
+    expected_sql = (
+        "SELECT privilege_type, grantee FROM information_schema.table_privileges "
+        "WHERE table_schema = 'test_schema' AND table_name = 'test_table' "
+        "AND grantor = CURRENT_USER AND grantee <> CURRENT_USER"
+    )
+    assert executed_sql == expected_sql
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 4
+    assert 'REVOKE SELECT ON "test_schema"."test_table" FROM "old_user"' in sql_calls
+    assert 'REVOKE UPDATE ON "test_schema"."test_table" FROM "legacy_user"' in sql_calls
+    assert 'GRANT SELECT ON "test_schema"."test_table" TO "user1", "user2"' in sql_calls
+    assert 'GRANT INSERT ON "test_schema"."test_table" TO "user3"' in sql_calls
+
+
+def test_sync_grants_config_with_overlaps(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    relation = exp.to_table("test_schema.test_table", dialect="redshift")
+    new_grants_config = {
+        "SELECT": ["user_shared", "user_new"],
+        "INSERT": ["user_shared", "user_writer"],
+    }
+
+    current_grants = [
+        ("SELECT", "user_shared"),
+        ("SELECT", "user_legacy"),
+        ("INSERT", "user_shared"),
+    ]
+    fetchall_mock = mocker.patch.object(adapter, "fetchall", return_value=current_grants)
+
+    adapter.sync_grants_config(relation, new_grants_config)
+
+    fetchall_mock.assert_called_once()
+    executed_query = fetchall_mock.call_args[0][0]
+    executed_sql = executed_query.sql(dialect="redshift")
+    expected_sql = (
+        "SELECT privilege_type, grantee FROM information_schema.table_privileges "
+        "WHERE table_schema = 'test_schema' AND table_name = 'test_table' "
+        "AND grantor = CURRENT_USER AND grantee <> CURRENT_USER"
+    )
+    assert executed_sql == expected_sql
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 3
+    assert 'REVOKE SELECT ON "test_schema"."test_table" FROM "user_legacy"' in sql_calls
+    assert 'GRANT SELECT ON "test_schema"."test_table" TO "user_new"' in sql_calls
+    assert 'GRANT INSERT ON "test_schema"."test_table" TO "user_writer"' in sql_calls
+
+
+@pytest.mark.parametrize(
+    "table_type",
+    [
+        (DataObjectType.TABLE),
+        (DataObjectType.VIEW),
+        (DataObjectType.MATERIALIZED_VIEW),
+    ],
+)
+def test_sync_grants_config_object_kind(
+    make_mocked_engine_adapter: t.Callable,
+    mocker: MockerFixture,
+    table_type: DataObjectType,
+) -> None:
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    relation = exp.to_table("test_schema.test_object", dialect="redshift")
+
+    mocker.patch.object(adapter, "fetchall", return_value=[])
+
+    adapter.sync_grants_config(relation, {"SELECT": ["user_test"]}, table_type)
+
+    sql_calls = to_sql_calls(adapter)
+    # we don't need to explicitly specify object_type for tables and views
+    assert sql_calls == [f'GRANT SELECT ON "test_schema"."test_object" TO "user_test"']
+
+
+def test_sync_grants_config_quotes(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    relation = exp.to_table('"TestSchema"."TestTable"', dialect="redshift")
+    new_grants_config = {"SELECT": ["user1", "user2"], "INSERT": ["user3"]}
+
+    current_grants = [("SELECT", "user_old"), ("UPDATE", "user_legacy")]
+    fetchall_mock = mocker.patch.object(adapter, "fetchall", return_value=current_grants)
+
+    adapter.sync_grants_config(relation, new_grants_config)
+
+    fetchall_mock.assert_called_once()
+    executed_query = fetchall_mock.call_args[0][0]
+    executed_sql = executed_query.sql(dialect="redshift")
+    expected_sql = (
+        "SELECT privilege_type, grantee FROM information_schema.table_privileges "
+        "WHERE table_schema = 'TestSchema' AND table_name = 'TestTable' "
+        "AND grantor = CURRENT_USER AND grantee <> CURRENT_USER"
+    )
+    assert executed_sql == expected_sql
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 4
+    assert 'REVOKE SELECT ON "TestSchema"."TestTable" FROM "user_old"' in sql_calls
+    assert 'REVOKE UPDATE ON "TestSchema"."TestTable" FROM "user_legacy"' in sql_calls
+    assert 'GRANT SELECT ON "TestSchema"."TestTable" TO "user1", "user2"' in sql_calls
+    assert 'GRANT INSERT ON "TestSchema"."TestTable" TO "user3"' in sql_calls
+
+
+def test_sync_grants_config_no_schema(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(RedshiftEngineAdapter)
+    relation = exp.to_table("test_table", dialect="redshift")
+    new_grants_config = {"SELECT": ["user1"], "INSERT": ["user2"]}
+
+    current_grants = [("UPDATE", "user_old")]
+    fetchall_mock = mocker.patch.object(adapter, "fetchall", return_value=current_grants)
+    get_schema_mock = mocker.patch.object(adapter, "_get_current_schema", return_value="public")
+
+    adapter.sync_grants_config(relation, new_grants_config)
+
+    get_schema_mock.assert_called_once()
+
+    executed_query = fetchall_mock.call_args[0][0]
+    executed_sql = executed_query.sql(dialect="redshift")
+    expected_sql = (
+        "SELECT privilege_type, grantee FROM information_schema.table_privileges "
+        "WHERE table_schema = 'public' AND table_name = 'test_table' "
+        "AND grantor = CURRENT_USER AND grantee <> CURRENT_USER"
+    )
+    assert executed_sql == expected_sql
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 3
+    assert 'REVOKE UPDATE ON "test_table" FROM "user_old"' in sql_calls
+    assert 'GRANT SELECT ON "test_table" TO "user1"' in sql_calls
+    assert 'GRANT INSERT ON "test_table" TO "user2"' in sql_calls
 
 
 def test_create_table_from_query_exists_no_if_not_exists(

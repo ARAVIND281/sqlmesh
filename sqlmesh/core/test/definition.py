@@ -100,8 +100,11 @@ class ModelTest(unittest.TestCase):
         self._validate_and_normalize_test()
 
         if self.engine_adapter.default_catalog:
-            self._fixture_catalog: t.Optional[exp.Identifier] = exp.parse_identifier(
-                self.engine_adapter.default_catalog, dialect=self._test_adapter_dialect
+            self._fixture_catalog: t.Optional[exp.Identifier] = normalize_identifiers(
+                exp.parse_identifier(
+                    self.engine_adapter.default_catalog, dialect=self._test_adapter_dialect
+                ),
+                dialect=self._test_adapter_dialect,
             )
         else:
             self._fixture_catalog = None
@@ -305,7 +308,6 @@ class ModelTest(unittest.TestCase):
                 expected,
                 actual,
                 check_dtype=False,
-                check_datetimelike_compat=True,
                 check_like=True,  # Ignore column order
             )
         except AssertionError as e:
@@ -352,11 +354,12 @@ class ModelTest(unittest.TestCase):
                         for df in _split_df_by_column_pairs(diff)
                     )
                 else:
-                    from pandas import MultiIndex
+                    from pandas import DataFrame, MultiIndex
 
                     levels = t.cast(MultiIndex, diff.columns).levels[0]
                     for col in levels:
-                        col_diff = diff[col]
+                        # diff[col] returns a DataFrame when columns is a MultiIndex
+                        col_diff = t.cast(DataFrame, diff[col])
                         if not col_diff.empty:
                             table = df_to_table(
                                 f"[bold red]Column '{col}' mismatch{failed_subtest}[/bold red]",
@@ -450,6 +453,9 @@ class ModelTest(unittest.TestCase):
         ctes = outputs.get("ctes")
         query = outputs.get("query")
         partial = outputs.pop("partial", None)
+
+        if ctes is None and query is None:
+            _raise_error("Incomplete test, outputs must contain 'query' or 'ctes'", self.path)
 
         def _normalize_rows(
             values: t.List[Row] | t.Dict,
@@ -605,20 +611,27 @@ class ModelTest(unittest.TestCase):
         - Globally patch the SQLGlot dialect so that any date/time nodes are evaluated at the `execution_time` during generation
         """
         import time_machine
+        from sqlglot.generator import _DISPATCH_CACHE
 
         lock_ctx: AbstractContextManager = (
             self.CONCURRENT_RENDER_LOCK if self.concurrency else nullcontext()
         )
         time_ctx: AbstractContextManager = nullcontext()
         dialect_patch_ctx: AbstractContextManager = nullcontext()
+        dispatch_patch_ctx: AbstractContextManager = nullcontext()
 
         if self._execution_time:
+            generator_class = self._test_adapter_dialect.generator_class
             time_ctx = time_machine.travel(self._execution_time, tick=False)
-            dialect_patch_ctx = patch.dict(
-                self._test_adapter_dialect.generator_class.TRANSFORMS, self._transforms
-            )
+            dialect_patch_ctx = patch.dict(generator_class.TRANSFORMS, self._transforms)
 
-        with lock_ctx, time_ctx, dialect_patch_ctx:
+            # sqlglot caches a dispatch table per generator class, so we need to patch
+            # it as well to ensure the overridden transforms are actually used
+            dispatch = _DISPATCH_CACHE.get(generator_class)
+            if dispatch is not None:
+                dispatch_patch_ctx = patch.dict(dispatch, self._transforms)
+
+        with lock_ctx, time_ctx, dialect_patch_ctx, dispatch_patch_ctx:
             yield
 
     def _execute(self, query: exp.Query | str) -> pd.DataFrame:
@@ -641,16 +654,16 @@ class ModelTest(unittest.TestCase):
             return self._execute(query)
 
         rows = values["rows"]
+        columns_str: t.Optional[t.List[str]] = None
         if columns:
+            columns_str = [str(c) for c in columns]
             referenced_columns = list(dict.fromkeys(col for row in rows for col in row))
             _raise_if_unexpected_columns(columns, referenced_columns)
 
             if partial:
-                columns = referenced_columns
+                columns_str = [c for c in columns_str if c in referenced_columns]
 
-        return pd.DataFrame.from_records(
-            rows, columns=[str(c) for c in columns] if columns else None
-        )
+        return pd.DataFrame.from_records(rows, columns=columns_str)
 
     def _add_missing_columns(
         self, query: exp.Query, all_columns: t.Optional[t.Collection[str]] = None
@@ -667,7 +680,7 @@ class ModelTest(unittest.TestCase):
 
 
 class SqlModelTest(ModelTest):
-    def test_ctes(self, ctes: t.Dict[str, exp.Expression], recursive: bool = False) -> None:
+    def test_ctes(self, ctes: t.Dict[str, exp.Expr], recursive: bool = False) -> None:
         """Run CTE queries and compare output to expected output"""
         for cte_name, values in self.body["outputs"].get("ctes", {}).items():
             with self.subTest(cte=cte_name):
@@ -704,7 +717,7 @@ class SqlModelTest(ModelTest):
             query = self._render_model_query()
             sql = query.sql(self._test_adapter_dialect, pretty=self.engine_adapter._pretty_sql)
 
-        with_clause = query.args.get("with")
+        with_clause = query.args.get("with_")
 
         if with_clause:
             self.test_ctes(
@@ -801,7 +814,7 @@ class PythonModelTest(ModelTest):
             actual_df.reset_index(drop=True, inplace=True)
             expected = self._create_df(values, columns=self.model.columns_to_types, partial=partial)
 
-            self.assert_equal(expected, actual_df, sort=False, partial=partial)
+            self.assert_equal(expected, actual_df, sort=True, partial=partial)
 
     def _execute_model(self) -> pd.DataFrame:
         """Executes the python model and returns a DataFrame."""
@@ -812,7 +825,7 @@ class PythonModelTest(ModelTest):
             time_kwargs = {key: variables.pop(key) for key in TIME_KWARG_KEYS if key in variables}
             df = next(self.model.render(context=self.context, variables=variables, **time_kwargs))
 
-        assert not isinstance(df, exp.Expression)
+        assert not isinstance(df, exp.Expr)
         return df if isinstance(df, pd.DataFrame) else df.toPandas()
 
 
@@ -898,7 +911,7 @@ def generate_test(
     if isinstance(model, SqlModel):
         assert isinstance(test, SqlModelTest)
         model_query = test._render_model_query()
-        with_clause = model_query.args.get("with")
+        with_clause = model_query.args.get("with_")
 
         if with_clause and include_ctes:
             ctes = {}
@@ -919,8 +932,7 @@ def generate_test(
                 cte_output = test._execute(cte_query)
                 ctes[cte.alias] = (
                     pandas_timestamp_to_pydatetime(
-                        cte_output.apply(lambda col: col.map(_normalize_df_value)),
-                        cte_query.named_selects,
+                        df=cte_output.apply(lambda col: col.map(_normalize_df_value)),
                     )
                     .replace({np.nan: None})
                     .to_dict(orient="records")

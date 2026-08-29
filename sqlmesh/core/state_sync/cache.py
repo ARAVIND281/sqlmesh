@@ -7,10 +7,12 @@ from sqlmesh.core.snapshot import (
     Snapshot,
     SnapshotId,
     SnapshotIdLike,
+    SnapshotIdAndVersionLike,
     SnapshotInfoLike,
 )
 from sqlmesh.core.snapshot.definition import Interval, SnapshotIntervals
 from sqlmesh.core.state_sync.base import DelegatingStateSync, StateSync
+from sqlmesh.core.state_sync.common import ExpiredBatchRange
 from sqlmesh.utils.date import TimeLike, now_timestamp
 
 
@@ -107,11 +109,17 @@ class CachingStateSync(DelegatingStateSync):
         self.state_sync.delete_snapshots(snapshot_ids)
 
     def delete_expired_snapshots(
-        self, ignore_ttl: bool = False, current_ts: t.Optional[int] = None
+        self,
+        batch_range: ExpiredBatchRange,
+        ignore_ttl: bool = False,
+        current_ts: t.Optional[int] = None,
     ) -> None:
-        current_ts = current_ts or now_timestamp()
         self.snapshot_cache.clear()
-        self.state_sync.delete_expired_snapshots(current_ts=current_ts, ignore_ttl=ignore_ttl)
+        self.state_sync.delete_expired_snapshots(
+            batch_range=batch_range,
+            ignore_ttl=ignore_ttl,
+            current_ts=current_ts,
+        )
 
     def add_snapshots_intervals(self, snapshots_intervals: t.Sequence[SnapshotIntervals]) -> None:
         for snapshot_intervals in snapshots_intervals:
@@ -128,7 +136,7 @@ class CachingStateSync(DelegatingStateSync):
 
     def remove_intervals(
         self,
-        snapshot_intervals: t.Sequence[t.Tuple[SnapshotInfoLike, Interval]],
+        snapshot_intervals: t.Sequence[t.Tuple[SnapshotIdAndVersionLike, Interval]],
         remove_shared_versions: bool = False,
     ) -> None:
         for s, _ in snapshot_intervals:

@@ -1,10 +1,26 @@
-import { useVirtualizer } from '@tanstack/react-virtual'
+import {
+  useVirtualizer,
+  Virtualizer,
+  type VirtualItem,
+} from '@tanstack/react-virtual'
 import React from 'react'
 import { HorizontalContainer } from '../HorizontalContainer/HorizontalContainer'
-import { cn } from '@/utils'
+import { cn } from '@sqlmesh-common/utils'
 import { Button } from '../Button/Button'
 import { ScrollContainer } from '../ScrollContainer/ScrollContainer'
 import { VerticalContainer } from '../VerticalContainer/VerticalContainer'
+
+export interface VirtualListProps<TItem> {
+  items: TItem[]
+  estimatedListItemHeight: number
+  renderListItem: (
+    item: TItem,
+    virtualItem?: VirtualItem,
+    virtualizer?: Virtualizer<HTMLDivElement, Element>,
+  ) => React.ReactNode
+  isSelected?: (item: TItem) => boolean
+  className?: string
+}
 
 export function VirtualList<TItem>({
   items,
@@ -12,13 +28,7 @@ export function VirtualList<TItem>({
   renderListItem,
   isSelected,
   className,
-}: {
-  items: TItem[]
-  estimatedListItemHeight: number
-  renderListItem: (item: TItem) => React.ReactNode
-  isSelected?: (item: TItem) => boolean
-  className?: string
-}) {
+}: VirtualListProps<TItem>) {
   const scrollableAreaRef = React.useRef<HTMLDivElement>(null)
 
   const [activeItemIndex] = React.useMemo(() => {
@@ -96,7 +106,7 @@ export function VirtualList<TItem>({
       )}
       <ScrollContainer
         ref={scrollableAreaRef}
-        className="h-auto"
+        className="h-auto overflow-auto"
       >
         <div
           style={{

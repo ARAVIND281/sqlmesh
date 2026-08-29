@@ -15,6 +15,7 @@ from sqlmesh.core.config import Config, ModelDefaultsConfig
 from sqlmesh.core.dialect import jinja_query
 from sqlmesh.core.model import SqlModel
 from sqlmesh.core.model.kind import OnDestructiveChange, OnAdditiveChange
+from sqlmesh.core.state_sync import CachingStateSync, EngineAdapterStateSync
 from sqlmesh.dbt.builtin import Api
 from sqlmesh.dbt.column import ColumnConfig
 from sqlmesh.dbt.common import Dependencies
@@ -46,7 +47,8 @@ from sqlmesh.dbt.target import (
 )
 from sqlmesh.dbt.test import TestConfig
 from sqlmesh.utils.errors import ConfigError
-from sqlmesh.utils.yaml import load as yaml_load
+from sqlmesh.utils.yaml import load as yaml_load, dump as yaml_dump
+from tests.dbt.conftest import EmptyProjectCreator
 
 pytestmark = pytest.mark.dbt
 
@@ -91,8 +93,10 @@ def test_update(current: t.Dict[str, t.Any], new: t.Dict[str, t.Any], expected: 
 
 def test_model_to_sqlmesh_fields(dbt_dummy_postgres_config: PostgresConfig):
     model_config = ModelConfig(
+        unique_id="model.package.name",
         name="name",
         package_name="package",
+        fqn=["package", "name"],
         alias="model",
         schema="custom",
         database="database",
@@ -123,6 +127,8 @@ def test_model_to_sqlmesh_fields(dbt_dummy_postgres_config: PostgresConfig):
 
     assert isinstance(model, SqlModel)
     assert model.name == "database.custom.model"
+    assert model.dbt_unique_id == "model.package.name"
+    assert model.dbt_fqn == "package.name"
     assert model.description == "test model"
     assert (
         model.render_query_or_raise().sql()
@@ -145,7 +151,7 @@ def test_model_to_sqlmesh_fields(dbt_dummy_postgres_config: PostgresConfig):
     assert kind.on_additive_change == OnAdditiveChange.ALLOW
     assert (
         kind.merge_filter.sql(dialect=model.dialect)  # type: ignore
-        == """55 > "__MERGE_SOURCE__"."b" AND "__MERGE_TARGET__"."session_start" > CURRENT_DATE + INTERVAL '7'"""
+        == """55 > "__MERGE_SOURCE__"."b" AND "__MERGE_TARGET__"."session_start" > CURRENT_DATE + INTERVAL '7 DAY'"""
     )
 
     model = model_config.update_with({"dialect": "snowflake"}).to_sqlmesh(context)
@@ -185,7 +191,9 @@ def test_model_to_sqlmesh_fields(dbt_dummy_postgres_config: PostgresConfig):
 def test_test_to_sqlmesh_fields():
     sql = "SELECT * FROM FOO WHERE cost > 100"
     test_config = TestConfig(
+        unique_id="test.test_package.foo_test",
         name="foo_test",
+        fqn=["test_package", "foo_test"],
         sql=sql,
         model_name="Foo",
         column_name="cost",
@@ -199,6 +207,8 @@ def test_test_to_sqlmesh_fields():
     audit = test_config.to_sqlmesh(context)
 
     assert audit.name == "foo_test"
+    assert audit.dbt_unique_id == "test.test_package.foo_test"
+    assert audit.dbt_fqn == "test_package.foo_test"
     assert audit.dialect == "duckdb"
     assert not audit.skip
     assert audit.blocking
@@ -235,6 +245,31 @@ def test_test_to_sqlmesh_fields():
     audit = test_config.to_sqlmesh(context)
 
     assert audit.dialect == "bigquery"
+
+
+def test_test_config_canonical_name():
+    test_config_upper_case_package = TestConfig(
+        name="foo_test",
+        package_name="TEST_PACKAGE",
+        sql="SELECT 1",
+    )
+
+    assert test_config_upper_case_package.canonical_name == "test_package.foo_test"
+
+    test_config_mixed_case_package = TestConfig(
+        name="Bar_Test",
+        package_name="MixedCase_Package",
+        sql="SELECT 1",
+    )
+
+    assert test_config_mixed_case_package.canonical_name == "mixedcase_package.bar_test"
+
+    test_config_no_package = TestConfig(
+        name="foo_bar_test",
+        sql="SELECT 1",
+    )
+
+    assert test_config_no_package.canonical_name == "foo_bar_test"
 
 
 def test_singular_test_to_standalone_audit(dbt_dummy_postgres_config: PostgresConfig):
@@ -343,17 +378,40 @@ def test_variables(assert_exp_eq, sushi_test_project):
             "customers:customer_id": "customer_id",
             "some_var": ["foo", "bar"],
         },
+        "some_var": "should be overridden in customers package",
+        "invalid_var": "{{ ref('ref_without_closing_paren' }}",
     }
     expected_customer_variables = {
-        "some_var": ["foo", "bar"],
+        "some_var": ["foo", "bar"],  # Takes precedence over the root project variable
         "some_other_var": 5,
-        "yet_another_var": 5,
         "customers:bla": False,
         "customers:customer_id": "customer_id",
+        "yet_another_var": 1,  # Make sure that the project variable takes precedence
+        "top_waiters:limit": "{{ get_top_waiters_limit() }}",
+        "top_waiters:revenue": "revenue",
+        "customers:boo": ["a", "b"],
+        "nested_vars": {
+            "some_nested_var": 2,
+        },
+        "dynamic_test_var": 3,
+        "list_var": [
+            {"name": "item1", "value": 1},
+            {"name": "item2", "value": 2},
+        ],
+        "invalid_var": "{{ ref('ref_without_closing_paren' }}",
     }
-
     assert sushi_test_project.packages["sushi"].variables == expected_sushi_variables
     assert sushi_test_project.packages["customers"].variables == expected_customer_variables
+
+
+@pytest.mark.slow
+def test_variables_override(init_and_plan_context: t.Callable):
+    context, _ = init_and_plan_context(
+        "tests/fixtures/dbt/sushi_test", config="test_config_with_var_override"
+    )
+    dbt_project = context._loaders[0]._load_projects()[0]  # type: ignore
+    assert dbt_project.packages["sushi"].variables["some_var"] == "overridden_from_config_py"
+    assert dbt_project.packages["customers"].variables["some_var"] == "overridden_from_config_py"
 
 
 @pytest.mark.slow
@@ -461,6 +519,71 @@ def test_quoting():
 
     source.quoting["schema"] = False
     assert str(BaseRelation.create(**source.relation_info)) == 'foo."bar"'
+
+
+def test_source_canonical_name_with_dots_and_spaces(mocker):
+    from dbt.adapters.base import BaseRelation
+
+    mock_context = mocker.Mock()
+    mock_context.target.database = "target_db"
+
+    def mock_source_macro(source_name, table_name):
+        if table_name == "my_table_dot":
+            identifier = "FILENAME.CSV"
+        elif table_name == "my_table_space":
+            identifier = "my table space"
+        else:
+            identifier = "my_table_std"
+        return BaseRelation.create(
+            database="RAW_DEV",
+            schema="raw_schema",
+            identifier=identifier,
+        )
+
+    mock_context.get_callable_macro.return_value = mock_source_macro
+
+    # 1. Identifier with a dot
+    source_dot = SourceConfig(
+        name="my_table_dot",
+        source_name="my_source",
+        identifier="FILENAME.CSV",
+    )
+    assert source_dot.canonical_name(mock_context) == 'RAW_DEV.raw_schema."FILENAME.CSV"'
+
+    # 2. Identifier with a space
+    source_space = SourceConfig(
+        name="my_table_space",
+        source_name="my_source",
+        identifier="my table space",
+    )
+    assert source_space.canonical_name(mock_context) == 'RAW_DEV.raw_schema."my table space"'
+
+    # 3. Standard identifier (without dots or spaces) should not be quoted
+    source_std = SourceConfig(
+        name="my_table_std",
+        source_name="my_source",
+        identifier="my_table_std",
+    )
+    assert source_std.canonical_name(mock_context) == "RAW_DEV.raw_schema.my_table_std"
+
+    # 4. Standard identifier, but with database matching target database (to test database omission)
+    mock_context_target_db = mocker.Mock()
+    mock_context_target_db.target.database = "RAW_DEV"
+    mock_context_target_db.get_callable_macro.return_value = mock_source_macro
+
+    source_dot_target = SourceConfig(
+        name="my_table_dot",
+        source_name="my_source",
+        identifier="FILENAME.CSV",
+    )
+    source_std_target = SourceConfig(
+        name="my_table_std",
+        source_name="my_source",
+        identifier="my_table_std",
+    )
+
+    assert source_dot_target.canonical_name(mock_context_target_db) == 'raw_schema."FILENAME.CSV"'
+    assert source_std_target.canonical_name(mock_context_target_db) == "raw_schema.my_table_std"
 
 
 def _test_warehouse_config(
@@ -1155,3 +1278,37 @@ test_empty_vars:
     # Verify the variables are empty (not causing any issues)
     assert project.packages["test_empty_vars"].variables == {}
     assert project.context.variables == {}
+
+
+def test_infer_state_schema_name(create_empty_project: EmptyProjectCreator):
+    project_dir, _ = create_empty_project("test_foo", "dev")
+
+    # infer_state_schema_name defaults to False if omitted
+    config = sqlmesh_config(project_root=project_dir)
+    assert config.dbt
+    assert not config.dbt.infer_state_schema_name
+    assert config.get_state_schema() == "sqlmesh"
+
+    # create_empty_project() uses the default dbt template for sqlmesh yaml config which
+    # sets infer_state_schema_name=True
+    ctx = Context(paths=[project_dir])
+    assert ctx.config.dbt
+    assert ctx.config.dbt.infer_state_schema_name
+    assert ctx.config.get_state_schema() == "sqlmesh_state_test_foo_main"
+    assert isinstance(ctx.state_sync, CachingStateSync)
+    assert isinstance(ctx.state_sync.state_sync, EngineAdapterStateSync)
+    assert ctx.state_sync.state_sync.schema == "sqlmesh_state_test_foo_main"
+
+    # If the user delberately overrides state_schema then we should respect this choice
+    config_file = project_dir / "sqlmesh.yaml"
+    config_yaml = yaml_load(config_file)
+    config_yaml["gateways"] = {"dev": {"state_schema": "state_override"}}
+    config_file.write_text(yaml_dump(config_yaml))
+
+    ctx = Context(paths=[project_dir])
+    assert ctx.config.dbt
+    assert ctx.config.dbt.infer_state_schema_name
+    assert ctx.config.get_state_schema() == "state_override"
+    assert isinstance(ctx.state_sync, CachingStateSync)
+    assert isinstance(ctx.state_sync.state_sync, EngineAdapterStateSync)
+    assert ctx.state_sync.state_sync.schema == "state_override"

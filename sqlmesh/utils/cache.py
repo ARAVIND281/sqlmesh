@@ -59,8 +59,20 @@ class FileCache(t.Generic[T]):
         threshold = to_datetime("1 week ago").timestamp()
         # delete all old cache files
         for file in self._path.glob("*"):
-            if not file.stem.startswith(self._cache_version) or file.stat().st_atime < threshold:
-                file.unlink(missing_ok=True)
+            if IS_WINDOWS:
+                # the file.stat() call below will fail on windows if the :file name is longer than 260 chars
+                file = fix_windows_path(file)
+
+            try:
+                stat_result = file.stat()
+                if (
+                    not file.stem.startswith(self._cache_version)
+                    or stat_result.st_atime < threshold
+                ):
+                    file.unlink(missing_ok=True)
+            except FileNotFoundError:
+                # File was deleted between glob() and stat() — skip stale cache entries gracefully
+                continue
 
     def get_or_load(self, name: str, entry_id: str = "", *, loader: t.Callable[[], T]) -> T:
         """Returns an existing cached entry or loads and caches a new one.
@@ -133,7 +145,7 @@ class FileCache(t.Generic[T]):
 
     def _cache_entry_path(self, name: str, entry_id: str = "") -> Path:
         entry_file_name = "__".join(p for p in (self._cache_version, name, entry_id) if p)
-        full_path = self._path / sanitize_name(entry_file_name)
+        full_path = self._path / sanitize_name(entry_file_name, include_unicode=True)
         if IS_WINDOWS:
             # handle paths longer than 260 chars
             full_path = fix_windows_path(full_path)

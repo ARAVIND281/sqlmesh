@@ -11,6 +11,9 @@ from unittest import mock
 from unittest.mock import patch
 import logging
 
+
+import time_machine
+
 import numpy as np  # noqa: TID253
 import pandas as pd  # noqa: TID253
 import pytest
@@ -22,6 +25,7 @@ from sqlglot.optimizer.qualify_columns import quote_identifiers
 
 from sqlmesh import Config, Context
 from sqlmesh.cli.project_init import init_example_project
+from sqlmesh.core.config.common import VirtualEnvironmentMode
 from sqlmesh.core.config.connection import ConnectionConfig
 import sqlmesh.core.dialect as d
 from sqlmesh.core.environment import EnvironmentSuffixTarget
@@ -409,6 +413,12 @@ def test_materialized_view(ctx_query_and_df: TestContext):
         )
     if ctx.engine_adapter.dialect == "snowflake":
         pytest.skip("Snowflake requires enterprise edition which we do not have setup")
+    if ctx.engine_adapter.dialect == "starrocks":
+        pytest.skip(
+            "StarRocks materialized views require a REFRESH clause (refresh_moment/refresh_scheme), "
+            "which this generic test does not provide; StarRocks MVs are covered by "
+            "test_integration_starrocks.py"
+        )
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01"},
@@ -773,6 +783,8 @@ def test_insert_overwrite_by_time_partition(ctx_query_and_df: TestContext):
         ds_type = "datetime"
     if ctx.dialect == "tsql":
         ds_type = "varchar(max)"
+    if ctx.dialect == "starrocks":
+        ds_type = "datetime"
 
     ctx.columns_to_types = {"id": "int", "ds": ds_type}
     table = ctx.table("test_table")
@@ -861,6 +873,8 @@ def test_insert_overwrite_by_time_partition_source_columns(ctx_query_and_df: Tes
         ds_type = "datetime"
     if ctx.dialect == "tsql":
         ds_type = "varchar(max)"
+    if ctx.dialect == "starrocks":
+        ds_type = "datetime"
 
     ctx.columns_to_types = {"id": "int", "ds": ds_type}
     columns_to_types = {
@@ -1938,10 +1952,21 @@ def test_transaction(ctx: TestContext):
     ctx.compare_with_current(table, input_data)
 
 
-def test_sushi(ctx: TestContext, tmp_path: pathlib.Path):
+@pytest.mark.parametrize(
+    "virtual_environment_mode", [VirtualEnvironmentMode.FULL, VirtualEnvironmentMode.DEV_ONLY]
+)
+def test_sushi(
+    ctx: TestContext, tmp_path: pathlib.Path, virtual_environment_mode: VirtualEnvironmentMode
+):
     if ctx.mark == "athena_hive":
         pytest.skip(
             "Sushi end-to-end tests only need to run once for Athena because sushi needs a hybrid of both Hive and Iceberg"
+        )
+    if ctx.dialect == "starrocks":
+        pytest.skip(
+            "StarRocks requires incremental models to use a PRIMARY KEY table; the shared sushi "
+            "example uses cross-engine incremental/SCD models without a StarRocks primary_key, so "
+            "this end-to-end test does not apply to StarRocks"
         )
 
     sushi_test_schema = ctx.add_test_suffix("sushi")
@@ -1984,6 +2009,7 @@ def test_sushi(ctx: TestContext, tmp_path: pathlib.Path):
             ).sql(dialect=config.model_defaults.dialect)
             for e in before_all
         ]
+        config.virtual_environment_mode = virtual_environment_mode
 
     context = ctx.create_context(_mutate_config, path=tmp_path, ephemeral_state_connection=False)
 
@@ -2341,6 +2367,13 @@ def test_sushi(ctx: TestContext, tmp_path: pathlib.Path):
 
 
 def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
+    if ctx.dialect == "starrocks":
+        pytest.skip(
+            "StarRocks requires incremental models to use a PRIMARY KEY table; the default example "
+            "project's incremental_model has no StarRocks primary_key, so this cross-engine test "
+            "does not apply to StarRocks"
+        )
+
     schema_name = ctx.add_test_suffix(TEST_SCHEMA)
     state_schema = ctx.add_test_suffix("sqlmesh_state")
 
@@ -2423,9 +2456,9 @@ def test_init_project(ctx: TestContext, tmp_path: pathlib.Path):
 
     if ctx.engine_adapter.SUPPORTS_QUERY_EXECUTION_TRACKING:
         assert actual_execution_stats["incremental_model"].total_rows_processed == 7
-        # snowflake doesn't track rows for CTAS
+        # snowflake and redshift don't track rows for CTAS
         assert actual_execution_stats["full_model"].total_rows_processed == (
-            None if ctx.mark.startswith("snowflake") else 3
+            None if ctx.mark.startswith("snowflake") or ctx.mark.startswith("redshift") else 3
         )
         assert actual_execution_stats["seed_model"].total_rows_processed == (
             None if ctx.mark.startswith("snowflake") else 7
@@ -2569,6 +2602,7 @@ def test_dialects(ctx: TestContext):
                 "mysql": pd.Timestamp("2020-01-01 00:00:00"),
                 "spark": pd.Timestamp("2020-01-01 00:00:00"),
                 "databricks": pd.Timestamp("2020-01-01 00:00:00"),
+                "starrocks": pd.Timestamp("2020-01-01 00:00:00"),
             },
         ),
         (
@@ -3637,6 +3671,12 @@ def test_janitor(
         and not ctx.engine_adapter.SUPPORTS_CREATE_DROP_CATALOG
     ):
         pytest.skip("Engine does not support catalog-based virtual environments")
+    if ctx.dialect == "starrocks":
+        pytest.skip(
+            "StarRocks requires incremental models to use a PRIMARY KEY table; the example project "
+            "used here has an incremental_model without a StarRocks primary_key, so this "
+            "cross-engine test does not apply to StarRocks"
+        )
 
     schema = ctx.schema()  # catalog.schema
     parsed_schema = d.to_schema(schema)
@@ -3767,7 +3807,7 @@ def test_janitor(
     ]
 
 
-def test_materialized_view_evaluation(ctx: TestContext, mocker: MockerFixture):
+def test_materialized_view_evaluation(ctx: TestContext):
     adapter = ctx.engine_adapter
     dialect = ctx.dialect
 
@@ -3775,6 +3815,12 @@ def test_materialized_view_evaluation(ctx: TestContext, mocker: MockerFixture):
         pytest.skip(f"Skipping engine {dialect} as it does not support materialized views")
     elif dialect in ("snowflake", "databricks"):
         pytest.skip(f"Skipping {dialect} as they're not enabled on standard accounts")
+    elif dialect == "starrocks":
+        pytest.skip(
+            "StarRocks materialized views require a REFRESH clause (refresh_moment/refresh_scheme), "
+            "which this generic test does not provide; StarRocks MVs are covered by "
+            "test_integration_starrocks.py"
+        )
 
     model_name = ctx.table("test_tbl")
     mview_name = ctx.table("test_mview")
@@ -3827,3 +3873,246 @@ def test_materialized_view_evaluation(ctx: TestContext, mocker: MockerFixture):
         assert any("Replacing view" in call[0][0] for call in mock_logger.call_args_list)
 
     _assert_mview_value(value=2)
+
+
+def test_unicode_characters(ctx: TestContext, tmp_path: Path):
+    # Engines that don't quote identifiers in views are incompatible with unicode characters in model names
+    # at the time of writing this is Spark/Trino and they do this for compatibility reasons.
+    # I also think Spark may not support unicode in general but that would need to be verified.
+    if not ctx.engine_adapter.QUOTE_IDENTIFIERS_IN_VIEWS:
+        pytest.skip("Skipping as these engines have issues with unicode characters in model names")
+
+    model_name = "客户数据"
+    table = ctx.table(model_name).sql(dialect=ctx.dialect)
+    (tmp_path / "models").mkdir(exist_ok=True)
+
+    model_def = f"""
+    MODEL (
+        name {table},
+        kind FULL,
+        dialect '{ctx.dialect}'
+    );
+    SELECT 1 as id
+    """
+
+    (tmp_path / "models" / "客户数据.sql").write_text(model_def)
+
+    context = ctx.create_context(path=tmp_path)
+    context.plan(auto_apply=True, no_prompts=True)
+
+    results = ctx.get_metadata_results()
+    assert len(results.views) == 1
+    assert results.views[0].lower() == model_name
+
+    schema = d.to_schema(ctx.schema(), dialect=ctx.dialect)
+    schema_name = schema.args["db"].this
+    schema.args["db"].set("this", "sqlmesh__" + schema_name)
+    table_results = ctx.get_metadata_results(schema)
+    assert len(table_results.tables) == 1
+    assert table_results.tables[0].lower().startswith(schema_name.lower() + "________")
+
+
+def test_sync_grants_config(ctx: TestContext) -> None:
+    if not ctx.engine_adapter.SUPPORTS_GRANTS:
+        pytest.skip(
+            f"Skipping Test since engine adapter {ctx.engine_adapter.dialect} doesn't support grants"
+        )
+
+    table = ctx.table("sync_grants_integration")
+    select_privilege = ctx.get_select_privilege()
+    insert_privilege = ctx.get_insert_privilege()
+    update_privilege = ctx.get_update_privilege()
+    with ctx.create_users_or_roles("reader", "writer", "admin") as roles:
+        ctx.engine_adapter.create_table(table, {"id": exp.DataType.build("INT")})
+
+        initial_grants = {
+            select_privilege: [roles["reader"]],
+            insert_privilege: [roles["writer"]],
+        }
+        ctx.engine_adapter.sync_grants_config(table, initial_grants)
+
+        current_grants = ctx.engine_adapter._get_current_grants_config(table)
+        assert set(current_grants.get(select_privilege, [])) == {roles["reader"]}
+        assert set(current_grants.get(insert_privilege, [])) == {roles["writer"]}
+
+        target_grants = {
+            select_privilege: [roles["writer"], roles["admin"]],
+            update_privilege: [roles["admin"]],
+        }
+        ctx.engine_adapter.sync_grants_config(table, target_grants)
+
+        synced_grants = ctx.engine_adapter._get_current_grants_config(table)
+        assert set(synced_grants.get(select_privilege, [])) == {
+            roles["writer"],
+            roles["admin"],
+        }
+        assert set(synced_grants.get(update_privilege, [])) == {roles["admin"]}
+        assert synced_grants.get(insert_privilege, []) == []
+
+
+def test_grants_sync_empty_config(ctx: TestContext):
+    if not ctx.engine_adapter.SUPPORTS_GRANTS:
+        pytest.skip(
+            f"Skipping Test since engine adapter {ctx.engine_adapter.dialect} doesn't support grants"
+        )
+
+    table = ctx.table("grants_empty_test")
+    select_privilege = ctx.get_select_privilege()
+    insert_privilege = ctx.get_insert_privilege()
+    with ctx.create_users_or_roles("user") as roles:
+        ctx.engine_adapter.create_table(table, {"id": exp.DataType.build("INT")})
+
+        initial_grants = {
+            select_privilege: [roles["user"]],
+            insert_privilege: [roles["user"]],
+        }
+        ctx.engine_adapter.sync_grants_config(table, initial_grants)
+
+        initial_current_grants = ctx.engine_adapter._get_current_grants_config(table)
+        assert roles["user"] in initial_current_grants.get(select_privilege, [])
+        assert roles["user"] in initial_current_grants.get(insert_privilege, [])
+
+        ctx.engine_adapter.sync_grants_config(table, {})
+
+        final_grants = ctx.engine_adapter._get_current_grants_config(table)
+        assert final_grants == {}
+
+
+def test_grants_case_insensitive_grantees(ctx: TestContext):
+    if not ctx.engine_adapter.SUPPORTS_GRANTS:
+        pytest.skip(
+            f"Skipping Test since engine adapter {ctx.engine_adapter.dialect} doesn't support grants"
+        )
+
+    with ctx.create_users_or_roles("reader", "writer") as roles:
+        table = ctx.table("grants_quoted_test")
+        ctx.engine_adapter.create_table(table, {"id": exp.DataType.build("INT")})
+
+        reader = roles["reader"]
+        writer = roles["writer"]
+        select_privilege = ctx.get_select_privilege()
+
+        if ctx.dialect == "bigquery":
+            # BigQuery labels are case sensitive, e.g. serviceAccount
+            lablel, grantee = writer.split(":", 1)
+            upper_case_writer = f"{lablel}:{grantee.upper()}"
+        else:
+            upper_case_writer = writer.upper()
+
+        grants_config = {select_privilege: [reader, upper_case_writer]}
+        ctx.engine_adapter.sync_grants_config(table, grants_config)
+
+        # Grantees are still in lowercase
+        current_grants = ctx.engine_adapter._get_current_grants_config(table)
+        assert reader in current_grants.get(select_privilege, [])
+        assert writer in current_grants.get(select_privilege, [])
+
+        # Revoke writer
+        grants_config = {select_privilege: [reader.upper()]}
+        ctx.engine_adapter.sync_grants_config(table, grants_config)
+
+        current_grants = ctx.engine_adapter._get_current_grants_config(table)
+        assert reader in current_grants.get(select_privilege, [])
+        assert writer not in current_grants.get(select_privilege, [])
+
+
+def test_grants_plan(ctx: TestContext, tmp_path: Path):
+    if not ctx.engine_adapter.SUPPORTS_GRANTS:
+        pytest.skip(
+            f"Skipping Test since engine adapter {ctx.engine_adapter.dialect} doesn't support grants"
+        )
+
+    table = ctx.table("grant_model").sql(dialect="duckdb")
+    select_privilege = ctx.get_select_privilege()
+    insert_privilege = ctx.get_insert_privilege()
+    with ctx.create_users_or_roles("analyst", "etl_user") as roles:
+        (tmp_path / "models").mkdir(exist_ok=True)
+
+        model_def = f"""
+        MODEL (
+            name {table},
+            kind FULL,
+            grants (
+                '{select_privilege}' = ['{roles["analyst"]}']
+            ),
+            grants_target_layer 'all'
+        );
+        SELECT 1 as id, CURRENT_DATE as created_date
+        """
+
+        (tmp_path / "models" / "grant_model.sql").write_text(model_def)
+
+        context = ctx.create_context(path=tmp_path)
+        plan_result = context.plan(auto_apply=True, no_prompts=True)
+
+        assert len(plan_result.new_snapshots) == 1
+        snapshot = plan_result.new_snapshots[0]
+
+        # Physical layer w/ grants
+        table_name = snapshot.table_name()
+        view_name = snapshot.qualified_view_name.for_environment(
+            plan_result.environment_naming_info, dialect=ctx.dialect
+        )
+        current_grants = ctx.engine_adapter._get_current_grants_config(
+            exp.to_table(table_name, dialect=ctx.dialect)
+        )
+        assert current_grants == {select_privilege: [roles["analyst"]]}
+
+        # Virtual layer (view) w/ grants
+        virtual_grants = ctx.engine_adapter._get_current_grants_config(
+            exp.to_table(view_name, dialect=ctx.dialect)
+        )
+        assert virtual_grants == {select_privilege: [roles["analyst"]]}
+
+        # Update model with query change and new grants
+        updated_model = load_sql_based_model(
+            d.parse(
+                f"""
+                MODEL (
+                    name {table},
+                    kind FULL,
+                    grants (
+                        '{select_privilege}' = ['{roles["analyst"]}', '{roles["etl_user"]}'],
+                        '{insert_privilege}' = ['{roles["etl_user"]}']
+                    ),
+                    grants_target_layer 'all'
+                );
+                SELECT 1 as id, CURRENT_DATE as created_date, 'v2' as version
+                """,
+                default_dialect=context.default_dialect,
+            ),
+            dialect=context.default_dialect,
+        )
+        context.upsert_model(updated_model)
+
+        plan = context.plan(auto_apply=True, no_prompts=True)
+        plan_result = PlanResults.create(plan, ctx, ctx.add_test_suffix(TEST_SCHEMA))
+        assert len(plan_result.plan.directly_modified) == 1
+
+        new_snapshot = plan_result.snapshot_for(updated_model)
+        assert new_snapshot is not None
+
+        new_table_name = new_snapshot.table_name()
+        final_grants = ctx.engine_adapter._get_current_grants_config(
+            exp.to_table(new_table_name, dialect=ctx.dialect)
+        )
+        expected_final_grants = {
+            select_privilege: [roles["analyst"], roles["etl_user"]],
+            insert_privilege: [roles["etl_user"]],
+        }
+        assert set(final_grants.get(select_privilege, [])) == set(
+            expected_final_grants[select_privilege]
+        )
+        assert final_grants.get(insert_privilege, []) == expected_final_grants[insert_privilege]
+
+        # Virtual layer should also have the updated grants
+        updated_virtual_grants = ctx.engine_adapter._get_current_grants_config(
+            exp.to_table(view_name, dialect=ctx.dialect)
+        )
+        assert set(updated_virtual_grants.get(select_privilege, [])) == set(
+            expected_final_grants[select_privilege]
+        )
+        assert (
+            updated_virtual_grants.get(insert_privilege, [])
+            == expected_final_grants[insert_privilege]
+        )

@@ -15,6 +15,7 @@ from sqlmesh.core.dialect import parse_one
 from sqlmesh.core.model import SqlModel
 from sqlmesh.core.user import User, UserRole
 from sqlmesh.core.plan.definition import Plan
+from sqlmesh.core.linter.rule import RuleViolation
 from sqlmesh.integrations.github.cicd.config import GithubCICDBotConfig, MergeMethod
 from sqlmesh.integrations.github.cicd.controller import (
     BotCommand,
@@ -28,6 +29,29 @@ from tests.integrations.github.cicd.conftest import MockIssueComment
 from sqlmesh.utils.errors import SQLMeshError
 
 pytestmark = pytest.mark.github
+
+
+def add_linter_violations(controller: GithubController):
+    class _MockModel:
+        _path = "tests/linter_test.sql"
+
+    class _MockLinterRule:
+        name = "mock_linter_rule"
+
+    controller._console.show_linter_violations(
+        [
+            RuleViolation(
+                rule=_MockLinterRule(), violation_msg="Linter warning", violation_range=None
+            )
+        ],
+        _MockModel(),
+    )
+    controller._console.show_linter_violations(
+        [RuleViolation(rule=_MockLinterRule(), violation_msg="Linter error", violation_range=None)],
+        _MockModel(),
+        is_error=True,
+    )
+
 
 github_controller_approvers_params = [
     (
@@ -271,6 +295,67 @@ def test_pr_plan_min_intervals(github_client, make_controller):
     assert controller.pr_plan.start_override_per_model
 
 
+def test_pr_plan_preview_window(github_client, make_controller, mocker: MockerFixture):
+    context = mocker.MagicMock()
+    plan_builder = mocker.MagicMock()
+    plan = mocker.MagicMock(spec=Plan)
+    plan_builder.build.return_value = plan
+    context.config.plan.forward_only = False
+    context.plan_builder.return_value = plan_builder
+    mocker.patch("sqlmesh.integrations.github.cicd.controller.Context", return_value=context)
+
+    bot_config = GithubCICDBotConfig(default_pr_start="2025-01-01")
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        bot_config=bot_config,
+    )
+
+    assert controller.pr_plan is plan
+    context.plan_builder.assert_called_once_with(
+        environment="hello_world_2",
+        skip_tests=True,
+        skip_linter=True,
+        categorizer_config=bot_config.auto_categorize_changes,
+        start="2025-01-01",
+        min_intervals=None,
+        preview_start="yesterday",
+        preview_min_intervals=1,
+        skip_backfill=bot_config.skip_pr_backfill,
+        include_unmodified=False,
+        forward_only=controller.forward_only_plan,
+    )
+
+    context.plan_builder.reset_mock()
+    plan_builder.build.reset_mock()
+
+    bot_config = GithubCICDBotConfig(
+        default_pr_start="2025-01-01",
+        default_pr_preview_start="2 days ago",
+        pr_preview_min_intervals=2,
+    )
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        bot_config=bot_config,
+    )
+
+    assert controller.pr_plan is plan
+    context.plan_builder.assert_called_once_with(
+        environment="hello_world_2",
+        skip_tests=True,
+        skip_linter=True,
+        categorizer_config=bot_config.auto_categorize_changes,
+        start="2025-01-01",
+        min_intervals=None,
+        preview_start="2 days ago",
+        preview_min_intervals=2,
+        skip_backfill=bot_config.skip_pr_backfill,
+        include_unmodified=False,
+        forward_only=controller.forward_only_plan,
+    )
+
+
 def test_prod_plan(github_client, make_controller):
     controller = make_controller(
         "tests/fixtures/github/pull_request_synchronized.json", github_client
@@ -315,7 +400,8 @@ def test_prod_plan_with_gaps(github_client, make_controller):
 
     assert controller.prod_plan_with_gaps.environment.name == c.PROD
     assert not controller.prod_plan_with_gaps.skip_backfill
-    assert not controller._prod_plan_with_gaps_builder._auto_categorization_enabled
+    # auto_categorization should now be enabled to prevent uncategorized snapshot errors
+    assert controller._prod_plan_with_gaps_builder._auto_categorization_enabled
     assert not controller.prod_plan_with_gaps.no_gaps
     assert not controller._context.apply.called
     assert controller._context._run_plan_tests.call_args == call(skip_tests=True)
@@ -436,6 +522,33 @@ def test_deploy_to_prod_merge_error(github_client, make_controller):
         controller.deploy_to_prod()
 
 
+def test_deploy_to_prod_blocked_pr(github_client, make_controller):
+    mock_pull_request = github_client.get_repo().get_pull()
+    mock_pull_request.merged = False
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        merge_state_status=MergeStateStatus.BLOCKED,
+    )
+    with pytest.raises(
+        Exception,
+        match=r"^Branch protection or ruleset requirement is likely not satisfied, e.g. missing CODEOWNERS approval.*",
+    ):
+        controller.deploy_to_prod()
+
+
+def test_deploy_to_prod_not_blocked_pr_if_config_set(github_client, make_controller):
+    mock_pull_request = github_client.get_repo().get_pull()
+    mock_pull_request.merged = False
+    controller = make_controller(
+        "tests/fixtures/github/pull_request_synchronized.json",
+        github_client,
+        merge_state_status=MergeStateStatus.BLOCKED,
+        bot_config=GithubCICDBotConfig(check_if_blocked_on_deploy_to_prod=False),
+    )
+    controller.deploy_to_prod()
+
+
 def test_deploy_to_prod_dirty_pr(github_client, make_controller):
     mock_pull_request = github_client.get_repo().get_pull()
     mock_pull_request.merged = False
@@ -444,7 +557,10 @@ def test_deploy_to_prod_dirty_pr(github_client, make_controller):
         github_client,
         merge_state_status=MergeStateStatus.DIRTY,
     )
-    with pytest.raises(Exception, match=r"^Merge commit cannot be cleanly created.*"):
+    with pytest.raises(
+        Exception,
+        match=r"^Merge commit cannot be cleanly created. Likely from a merge conflict.*",
+    ):
         controller.deploy_to_prod()
 
 
@@ -660,12 +776,18 @@ def test_get_plan_summary_includes_warnings_and_errors(
     controller._console.log_warning("Warning 1\nWith multiline")
     controller._console.log_warning("Warning 2")
     controller._console.log_error("Error 1")
+    add_linter_violations(controller)
 
     summary = controller.get_plan_summary(controller.prod_plan)
 
-    assert ("> [!WARNING]\n>\n> - Warning 1\n> With multiline\n>\n> - Warning 2\n\n") in summary
-
-    assert ("> [!CAUTION]\n>\n> Error 1\n\n") in summary
+    assert ("> [!WARNING]\n>\n> - Warning 1\n> With multiline\n>\n> - Warning 2\n>\n>") in summary
+    assert (
+        "> Linter warnings for `tests/linter_test.sql`:\n>  - mock_linter_rule: Linter warning\n>"
+    ) in summary
+    assert ("> [!CAUTION]\n>\n> - Error 1\n>\n>") in summary
+    assert (
+        "> Linter **errors** for `tests/linter_test.sql`:\n>  - mock_linter_rule: Linter error\n>"
+    ) in summary
 
 
 def test_get_pr_environment_summary_includes_warnings_and_errors(
@@ -679,24 +801,39 @@ def test_get_pr_environment_summary_includes_warnings_and_errors(
 
     controller._console.log_warning("Warning 1")
     controller._console.log_error("Error 1")
+    add_linter_violations(controller)
 
     # completed with no exception triggers a SUCCESS conclusion and only shows warnings
     success_summary = controller.get_pr_environment_summary(
         conclusion=GithubCheckConclusion.SUCCESS
     )
-    assert "> [!WARNING]\n>\n> Warning 1\n" in success_summary
-    assert "> [!CAUTION]\n>\n> Error 1" not in success_summary
+    assert "> [!WARNING]\n>\n> - Warning 1\n" in success_summary
+    assert (
+        "> Linter warnings for `tests/linter_test.sql`:\n>  - mock_linter_rule: Linter warning\n"
+        in success_summary
+    )
+    assert "Error 1" not in success_summary
+    assert "mock_linter_rule: Linter error" not in success_summary
 
     # since they got consumed in the previous call
     controller._console.log_warning("Warning 1")
     controller._console.log_error("Error 1")
+    add_linter_violations(controller)
 
     # completed with an exception triggers a FAILED conclusion and shows errors
     error_summary = controller.get_pr_environment_summary(
         conclusion=GithubCheckConclusion.FAILURE, exception=SQLMeshError("Something broke")
     )
-    assert "> [!WARNING]\n>\n> Warning 1\n" in error_summary
-    assert "> [!CAUTION]\n>\n> Error 1" in error_summary
+    assert "> [!WARNING]\n>\n> - Warning 1\n>\n" in error_summary
+    assert (
+        "> Linter warnings for `tests/linter_test.sql`:\n>  - mock_linter_rule: Linter warning\n"
+        in error_summary
+    )
+    assert "[!CAUTION]\n> <details>\n>\n> - Error 1\n>\n" in error_summary
+    assert (
+        "> Linter **errors** for `tests/linter_test.sql`:\n>  - mock_linter_rule: Linter error\n"
+        in error_summary
+    )
 
 
 def test_pr_comment_deploy_indicator_includes_command_namespace(
@@ -778,3 +915,39 @@ def test_forward_only_config_falls_back_to_plan_config(
 
     controller._context.config.plan.forward_only = False
     assert controller.forward_only_plan is False
+
+
+def test_chunk_up_api_message_preserves_ascii_behavior(
+    github_client, make_event_issue_comment, make_controller
+):
+    controller = make_controller(make_event_issue_comment("created", "test"), github_client)
+
+    max_bytes = controller.MAX_BYTE_LENGTH
+    message = ("a" * max_bytes) + ("b" * max_bytes) + "c"
+
+    assert controller._chunk_up_api_message("") == []
+    assert controller._chunk_up_api_message(message) == [
+        "a" * max_bytes,
+        "b" * max_bytes,
+        "c",
+    ]
+
+
+@pytest.mark.parametrize("multibyte_char", ["🙂", "界"])
+def test_chunk_up_api_message_preserves_multibyte_chars(
+    github_client, make_event_issue_comment, make_controller, multibyte_char
+):
+    controller = make_controller(make_event_issue_comment("created", "test"), github_client)
+
+    max_bytes = controller.MAX_BYTE_LENGTH
+    # Place a multibyte character exactly on the byte boundary between two chunks so
+    # that byte-oriented slicing would bisect its UTF-8 encoding and drop it.
+    message = ("a" * (max_bytes - 1)) + multibyte_char + "b"
+    assert len(message.encode("utf-8")) > max_bytes
+
+    chunks = controller._chunk_up_api_message(message)
+
+    # No character is lost, so the chunks reassemble into the original message.
+    assert "".join(chunks) == message
+    # Each chunk still respects the GitHub API byte limit.
+    assert all(len(chunk.encode("utf-8")) <= max_bytes for chunk in chunks)

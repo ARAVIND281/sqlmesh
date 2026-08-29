@@ -9,15 +9,14 @@ from pytest_mock.plugin import MockerFixture
 from sqlglot import expressions as exp
 from sqlglot import parse_one
 
+from pathlib import Path
+from sqlmesh import model
 from sqlmesh.core.engine_adapter.mssql import MSSQLEngineAdapter
-from sqlmesh.core.snapshot import SnapshotEvaluator, SnapshotChangeCategory
+from sqlmesh.core.snapshot import SnapshotEvaluator, SnapshotChangeCategory, Snapshot
 from sqlmesh.core.model import load_sql_based_model
+from sqlmesh.core.model.kind import SCDType2ByTimeKind
 from sqlmesh.core import dialect as d
-from sqlmesh.core.engine_adapter.shared import (
-    DataObject,
-    DataObjectType,
-    InsertOverwriteStrategy,
-)
+from sqlmesh.core.engine_adapter.shared import DataObject, DataObjectType, SourceQuery
 from sqlmesh.utils.date import to_ds
 from tests.core.engine_adapter import to_sql_calls
 
@@ -337,46 +336,6 @@ def test_insert_overwrite_by_time_partition_supports_insert_overwrite_pandas_exi
         },
     )
     assert to_sql_calls(adapter) == [
-        f"""MERGE INTO [test_table] AS [__MERGE_TARGET__] USING (SELECT [a] AS [a], [ds] AS [ds] FROM (SELECT CAST([a] AS INTEGER) AS [a], CAST([ds] AS VARCHAR(MAX)) AS [ds] FROM [__temp_test_table_{temp_table_id}]) AS [_subquery] WHERE [ds] BETWEEN '2022-01-01' AND '2022-01-02') AS [__MERGE_SOURCE__] ON (1 = 0) WHEN NOT MATCHED BY SOURCE AND [ds] BETWEEN '2022-01-01' AND '2022-01-02' THEN DELETE WHEN NOT MATCHED THEN INSERT ([a], [ds]) VALUES ([a], [ds]);""",
-        f"DROP TABLE IF EXISTS [__temp_test_table_{temp_table_id}];",
-    ]
-
-
-def test_insert_overwrite_by_time_partition_replace_where_pandas(
-    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture, make_temp_table_name: t.Callable
-):
-    mocker.patch(
-        "sqlmesh.core.engine_adapter.mssql.MSSQLEngineAdapter.table_exists",
-        return_value=False,
-    )
-
-    adapter = make_mocked_engine_adapter(MSSQLEngineAdapter)
-    adapter.INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.REPLACE_WHERE
-
-    temp_table_mock = mocker.patch("sqlmesh.core.engine_adapter.EngineAdapter._get_temp_table")
-    table_name = "test_table"
-    temp_table_id = "abcdefgh"
-    temp_table_mock.return_value = make_temp_table_name(table_name, temp_table_id)
-
-    df = pd.DataFrame({"a": [1, 2], "ds": ["2022-01-01", "2022-01-02"]})
-    adapter.insert_overwrite_by_time_partition(
-        table_name,
-        df,
-        start="2022-01-01",
-        end="2022-01-02",
-        time_formatter=lambda x, _: exp.Literal.string(to_ds(x)),
-        time_column="ds",
-        target_columns_to_types={
-            "a": exp.DataType.build("INT"),
-            "ds": exp.DataType.build("STRING"),
-        },
-    )
-    adapter._connection_pool.get().bulk_copy.assert_called_with(
-        f"__temp_test_table_{temp_table_id}", [(1, "2022-01-01"), (2, "2022-01-02")]
-    )
-
-    assert to_sql_calls(adapter) == [
-        f"""IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '__temp_test_table_{temp_table_id}') EXEC('CREATE TABLE [__temp_test_table_{temp_table_id}] ([a] INTEGER, [ds] VARCHAR(MAX))');""",
         f"""MERGE INTO [test_table] AS [__MERGE_TARGET__] USING (SELECT [a] AS [a], [ds] AS [ds] FROM (SELECT CAST([a] AS INTEGER) AS [a], CAST([ds] AS VARCHAR(MAX)) AS [ds] FROM [__temp_test_table_{temp_table_id}]) AS [_subquery] WHERE [ds] BETWEEN '2022-01-01' AND '2022-01-02') AS [__MERGE_SOURCE__] ON (1 = 0) WHEN NOT MATCHED BY SOURCE AND [ds] BETWEEN '2022-01-01' AND '2022-01-02' THEN DELETE WHEN NOT MATCHED THEN INSERT ([a], [ds]) VALUES ([a], [ds]);""",
         f"DROP TABLE IF EXISTS [__temp_test_table_{temp_table_id}];",
     ]
@@ -874,7 +833,7 @@ def test_create_table_from_query(make_mocked_engine_adapter: t.Callable, mocker:
     columns_mock.assert_called_once_with(exp.table_("__temp_ctas_test_random_id", quoted=True))
 
     # We don't want to drop anything other than LIMIT 0
-    # See https://github.com/TobikoData/sqlmesh/issues/4048
+    # See https://github.com/SQLMesh/sqlmesh/issues/4048
     adapter.ctas(
         table_name="test_schema.test_table",
         query_or_df=parse_one(
@@ -889,7 +848,7 @@ def test_create_table_from_query(make_mocked_engine_adapter: t.Callable, mocker:
 
 
 def test_replace_query_strategy(adapter: MSSQLEngineAdapter, mocker: MockerFixture):
-    # ref issue 4472: https://github.com/TobikoData/sqlmesh/issues/4472
+    # ref issue 4472: https://github.com/SQLMesh/sqlmesh/issues/4472
     # The FULL strategy calls EngineAdapter.replace_query() which calls _insert_overwrite_by_condition() should use DELETE+INSERT and not MERGE
     expressions = d.parse(
         f"""
@@ -956,4 +915,111 @@ def test_replace_query_strategy(adapter: MSSQLEngineAdapter, mocker: MockerFixtu
         # subsequent - truncate + insert
         "TRUNCATE TABLE [test_table];",
         "INSERT INTO [test_table] ([a], [b]) SELECT [a] AS [a], [b] AS [b] FROM [db].[upstream_table] AS [upstream_table];",
+    ]
+
+
+def test_mssql_merge_exists_switches_strategy_from_truncate_to_merge(
+    make_mocked_engine_adapter: t.Callable, mocker: MockerFixture
+):
+    adapter = make_mocked_engine_adapter(MSSQLEngineAdapter)
+
+    query = exp.select("*").from_("source")
+    source_queries = [SourceQuery(query_factory=lambda: query)]
+
+    # Test WITHOUT mssql_merge_exists, should use DELETE+INSERT strategy
+    base_insert_overwrite = mocker.patch(
+        "sqlmesh.core.engine_adapter.base.EngineAdapter._insert_overwrite_by_condition"
+    )
+
+    adapter._insert_overwrite_by_condition(
+        table_name="target",
+        source_queries=source_queries,
+        target_columns_to_types={
+            "id": exp.DataType.build("INT"),
+            "value": exp.DataType.build("VARCHAR"),
+        },
+        where=None,
+    )
+
+    # Should call base DELETE+INSERT strategy
+    assert base_insert_overwrite.called
+    base_insert_overwrite.reset_mock()
+
+    # Test WITH mssql_merge_exists uses MERGE strategy
+    super_insert_overwrite = mocker.patch(
+        "sqlmesh.core.engine_adapter.base.EngineAdapterWithIndexSupport._insert_overwrite_by_condition"
+    )
+
+    adapter._insert_overwrite_by_condition(
+        table_name="target",
+        source_queries=source_queries,
+        target_columns_to_types={
+            "id": exp.DataType.build("INT"),
+            "value": exp.DataType.build("VARCHAR"),
+        },
+        where=None,
+        table_properties={"mssql_merge_exists": True},
+    )
+
+    # Should call super's MERGE strategy, not base DELETE+INSERT
+    assert super_insert_overwrite.called
+    assert not base_insert_overwrite.called
+
+
+def test_python_scd2_model_preserves_physical_properties(make_snapshot):
+    @model(
+        "test_schema.python_scd2_with_mssql_merge",
+        kind=SCDType2ByTimeKind(
+            unique_key=["id"],
+            valid_from_name="valid_from",
+            valid_to_name="valid_to",
+            updated_at_name="updated_at",
+        ),
+        columns={
+            "id": "INT",
+            "value": "VARCHAR",
+            "updated_at": "TIMESTAMP",
+            "valid_from": "TIMESTAMP",
+            "valid_to": "TIMESTAMP",
+        },
+        physical_properties={"mssql_merge_exists": True},
+    )
+    def python_scd2_model(context, **kwargs):
+        import pandas as pd
+
+        return pd.DataFrame(
+            {"id": [1, 2], "value": ["a", "b"], "updated_at": ["2024-01-01", "2024-01-02"]}
+        )
+
+    m = model.get_registry()["test_schema.python_scd2_with_mssql_merge"].model(
+        module_path=Path("."),
+        path=Path("."),
+        dialect="tsql",
+    )
+
+    # verify model has physical_properties that trigger merge strategy
+    assert "mssql_merge_exists" in m.physical_properties
+    snapshot: Snapshot = make_snapshot(m)
+    assert snapshot.node.physical_properties == m.physical_properties
+    assert snapshot.node.physical_properties.get("mssql_merge_exists")
+
+
+def test_comments(make_mocked_engine_adapter: t.Callable, mocker: MockerFixture):
+    adapter = make_mocked_engine_adapter(MSSQLEngineAdapter)
+    table = exp.to_table("test_table")
+    comment = "\\"
+
+    mocker.patch.object(adapter, "_create_table")
+
+    adapter.create_table(
+        "test_table",
+        {"a": exp.DataType.build("INT"), "b": exp.DataType.build("INT")},
+        table_description=comment,
+        column_descriptions={"a": comment},
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert sql_calls == [
+        adapter._build_create_comment_table_exp(table, comment),
+        adapter._build_create_comment_column_exp(table, "a", comment),
     ]

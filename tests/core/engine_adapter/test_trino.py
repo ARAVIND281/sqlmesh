@@ -11,6 +11,7 @@ from sqlmesh.core.engine_adapter import TrinoEngineAdapter
 from sqlmesh.core.model import load_sql_based_model
 from sqlmesh.core.model.definition import SqlModel
 from sqlmesh.core.dialect import schema_
+from sqlmesh.utils.date import to_ds
 from sqlmesh.utils.errors import SQLMeshError
 from tests.core.engine_adapter import to_sql_calls
 
@@ -403,6 +404,123 @@ def test_delta_timestamps(make_mocked_engine_adapter: t.Callable):
     }
 
 
+def test_timestamp_mapping():
+    """Test that timestamp_mapping config property is properly defined and accessible."""
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+    )
+
+    assert config._connection_factory_with_kwargs.keywords["source"] == "sqlmesh"
+
+    adapter = config.create_engine_adapter()
+    assert adapter.timestamp_mapping is None
+
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+        source="my_source",
+        timestamp_mapping={
+            "TIMESTAMP": "TIMESTAMP(6)",
+            "TIMESTAMP(3)": "TIMESTAMP WITH TIME ZONE",
+        },
+    )
+    assert config._connection_factory_with_kwargs.keywords["source"] == "my_source"
+    adapter = config.create_engine_adapter()
+    assert adapter.timestamp_mapping is not None
+    assert adapter.timestamp_mapping[exp.DataType.build("TIMESTAMP")] == exp.DataType.build(
+        "TIMESTAMP(6)"
+    )
+
+
+def test_delta_timestamps_with_custom_mapping(make_mocked_engine_adapter: t.Callable):
+    """Test that _apply_timestamp_mapping + _to_delta_ts respects custom timestamp_mapping."""
+    # Create config with custom timestamp mapping
+    # Mapped columns are skipped by _to_delta_ts
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+        timestamp_mapping={
+            "TIMESTAMP": "TIMESTAMP(3)",
+            "TIMESTAMP(1)": "TIMESTAMP(3)",
+            "TIMESTAMP WITH TIME ZONE": "TIMESTAMP(6) WITH TIME ZONE",
+            "TIMESTAMP(1) WITH TIME ZONE": "TIMESTAMP(6) WITH TIME ZONE",
+        },
+    )
+
+    adapter = make_mocked_engine_adapter(
+        TrinoEngineAdapter, timestamp_mapping=config.timestamp_mapping
+    )
+
+    ts3 = exp.DataType.build("timestamp(3)")
+    ts6_tz = exp.DataType.build("timestamp(6) with time zone")
+
+    columns_to_types = {
+        "ts": exp.DataType.build("TIMESTAMP"),
+        "ts_1": exp.DataType.build("TIMESTAMP(1)"),
+        "ts_tz": exp.DataType.build("TIMESTAMP WITH TIME ZONE"),
+        "ts_tz_1": exp.DataType.build("TIMESTAMP(1) WITH TIME ZONE"),
+    }
+
+    # Apply mapping first, then convert to delta types (skipping mapped columns)
+    mapped_columns_to_types, mapped_column_names = adapter._apply_timestamp_mapping(
+        columns_to_types
+    )
+    delta_columns_to_types = adapter._to_delta_ts(mapped_columns_to_types, mapped_column_names)
+
+    # All types were mapped, so _to_delta_ts skips them - they keep their mapped types
+    assert delta_columns_to_types == {
+        "ts": ts3,
+        "ts_1": ts3,
+        "ts_tz": ts6_tz,
+        "ts_tz_1": ts6_tz,
+    }
+
+
+def test_delta_timestamps_with_partial_mapping(make_mocked_engine_adapter: t.Callable):
+    """Test that _apply_timestamp_mapping + _to_delta_ts uses custom mapping for specified types."""
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+        timestamp_mapping={
+            "TIMESTAMP": "TIMESTAMP(3)",
+        },
+    )
+
+    adapter = make_mocked_engine_adapter(
+        TrinoEngineAdapter, timestamp_mapping=config.timestamp_mapping
+    )
+
+    ts3 = exp.DataType.build("TIMESTAMP(3)")
+    ts6 = exp.DataType.build("timestamp(6)")
+    ts3_tz = exp.DataType.build("timestamp(3) with time zone")
+
+    columns_to_types = {
+        "ts": exp.DataType.build("TIMESTAMP"),
+        "ts_1": exp.DataType.build("TIMESTAMP(1)"),
+        "ts_tz": exp.DataType.build("TIMESTAMP WITH TIME ZONE"),
+    }
+
+    # Apply mapping first, then convert to delta types (skipping mapped columns)
+    mapped_columns_to_types, mapped_column_names = adapter._apply_timestamp_mapping(
+        columns_to_types
+    )
+    delta_columns_to_types = adapter._to_delta_ts(mapped_columns_to_types, mapped_column_names)
+
+    # TIMESTAMP is in mapping → TIMESTAMP(3), skipped by _to_delta_ts
+    # TIMESTAMP(1) is NOT in mapping, uses default TIMESTAMP → ts6
+    # TIMESTAMP WITH TIME ZONE is NOT in mapping, uses default TIMESTAMPTZ → ts3_tz
+    assert delta_columns_to_types == {
+        "ts": ts3,  # Mapped to TIMESTAMP(3), skipped by _to_delta_ts
+        "ts_1": ts6,  # Not in mapping, uses default
+        "ts_tz": ts3_tz,  # Not in mapping, uses default
+    }
+
+
 def test_table_format(trino_mocked_engine_adapter: TrinoEngineAdapter, mocker: MockerFixture):
     adapter = trino_mocked_engine_adapter
     mocker.patch(
@@ -668,7 +786,7 @@ def test_replace_table_catalog_support(
 
     adapter.replace_query(
         table_name=".".join([catalog_name, "schema", "test_table"]),
-        query_or_df=parse_one("SELECT 1 AS col"),
+        query_or_df=t.cast(exp.Query, parse_one("SELECT 1 AS col")),
     )
 
     sql_calls = to_sql_calls(adapter)
@@ -683,3 +801,148 @@ def test_replace_table_catalog_support(
             sql_calls[0]
             == f'CREATE TABLE IF NOT EXISTS "{catalog_name}"."schema"."test_table" AS SELECT 1 AS "col"'
         )
+
+
+@pytest.mark.parametrize(
+    "catalog_type_overrides", [{}, {"my_catalog": "hive"}, {"other_catalog": "iceberg"}]
+)
+def test_insert_overwrite_time_partition_hive(
+    make_mocked_engine_adapter: t.Callable, catalog_type_overrides: t.Dict[str, str]
+):
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+        catalog_type_overrides=catalog_type_overrides,
+    )
+    adapter: TrinoEngineAdapter = make_mocked_engine_adapter(
+        TrinoEngineAdapter, catalog_type_overrides=config.catalog_type_overrides
+    )
+    adapter.fetchone = MagicMock(return_value=None)  # type: ignore
+
+    adapter.insert_overwrite_by_time_partition(
+        table_name=".".join(["my_catalog", "schema", "test_table"]),
+        query_or_df=t.cast(exp.Query, parse_one("SELECT a, b FROM tbl")),
+        start="2022-01-01",
+        end="2022-01-02",
+        time_column="b",
+        time_formatter=lambda x, _: exp.Literal.string(to_ds(x)),
+        target_columns_to_types={"a": exp.DataType.build("INT"), "b": exp.DataType.build("STRING")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "SET SESSION my_catalog.insert_existing_partitions_behavior='OVERWRITE'",
+        'INSERT INTO "my_catalog"."schema"."test_table" ("a", "b") SELECT "a", "b" FROM (SELECT "a", "b" FROM "tbl") AS "_subquery" WHERE "b" BETWEEN \'2022-01-01\' AND \'2022-01-02\'',
+        "SET SESSION my_catalog.insert_existing_partitions_behavior='APPEND'",
+    ]
+
+
+@pytest.mark.parametrize(
+    "catalog_type_overrides",
+    [
+        {"my_catalog": "iceberg"},
+        {"my_catalog": "unknown"},
+    ],
+)
+def test_insert_overwrite_time_partition_iceberg(
+    make_mocked_engine_adapter: t.Callable, catalog_type_overrides: t.Dict[str, str]
+):
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+        catalog_type_overrides=catalog_type_overrides,
+    )
+    adapter: TrinoEngineAdapter = make_mocked_engine_adapter(
+        TrinoEngineAdapter, catalog_type_overrides=config.catalog_type_overrides
+    )
+    adapter.fetchone = MagicMock(return_value=None)  # type: ignore
+
+    adapter.insert_overwrite_by_time_partition(
+        table_name=".".join(["my_catalog", "schema", "test_table"]),
+        query_or_df=t.cast(exp.Query, parse_one("SELECT a, b FROM tbl")),
+        start="2022-01-01",
+        end="2022-01-02",
+        time_column="b",
+        time_formatter=lambda x, _: exp.Literal.string(to_ds(x)),
+        target_columns_to_types={"a": exp.DataType.build("INT"), "b": exp.DataType.build("STRING")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        'DELETE FROM "my_catalog"."schema"."test_table" WHERE "b" BETWEEN \'2022-01-01\' AND \'2022-01-02\'',
+        'INSERT INTO "my_catalog"."schema"."test_table" ("a", "b") SELECT "a", "b" FROM (SELECT "a", "b" FROM "tbl") AS "_subquery" WHERE "b" BETWEEN \'2022-01-01\' AND \'2022-01-02\'',
+    ]
+
+
+def test_delta_timestamps_with_non_timestamp_columns(make_mocked_engine_adapter: t.Callable):
+    """Test that _apply_timestamp_mapping + _to_delta_ts handles non-timestamp columns."""
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+        timestamp_mapping={
+            "TIMESTAMP": "TIMESTAMP(3)",
+        },
+    )
+
+    adapter = make_mocked_engine_adapter(
+        TrinoEngineAdapter, timestamp_mapping=config.timestamp_mapping
+    )
+
+    ts3 = exp.DataType.build("TIMESTAMP(3)")
+    ts6 = exp.DataType.build("timestamp(6)")
+
+    columns_to_types = {
+        "ts": exp.DataType.build("TIMESTAMP"),
+        "ts_1": exp.DataType.build("TIMESTAMP(1)"),
+        "int_col": exp.DataType.build("INT"),
+        "varchar_col": exp.DataType.build("VARCHAR(100)"),
+        "decimal_col": exp.DataType.build("DECIMAL(10,2)"),
+    }
+
+    # Apply mapping first, then convert to delta types (skipping mapped columns)
+    mapped_columns_to_types, mapped_column_names = adapter._apply_timestamp_mapping(
+        columns_to_types
+    )
+    delta_columns_to_types = adapter._to_delta_ts(mapped_columns_to_types, mapped_column_names)
+
+    # TIMESTAMP is in mapping → TIMESTAMP(3), skipped by _to_delta_ts
+    # TIMESTAMP(1) is NOT in mapping (exact match), uses default TIMESTAMP → ts6
+    # Non-timestamp columns should pass through unchanged
+    assert delta_columns_to_types == {
+        "ts": ts3,  # Mapped to TIMESTAMP(3), skipped by _to_delta_ts
+        "ts_1": ts6,  # Not in mapping, uses default
+        "int_col": exp.DataType.build("INT"),
+        "varchar_col": exp.DataType.build("VARCHAR(100)"),
+        "decimal_col": exp.DataType.build("DECIMAL(10,2)"),
+    }
+
+
+def test_delta_timestamps_with_empty_mapping(make_mocked_engine_adapter: t.Callable):
+    """Test that _to_delta_ts handles empty custom mapping dictionary."""
+    config = TrinoConnectionConfig(
+        user="user",
+        host="host",
+        catalog="catalog",
+        timestamp_mapping={},
+    )
+
+    adapter = make_mocked_engine_adapter(
+        TrinoEngineAdapter, timestamp_mapping=config.timestamp_mapping
+    )
+
+    ts6 = exp.DataType.build("timestamp(6)")
+    ts3_tz = exp.DataType.build("timestamp(3) with time zone")
+
+    columns_to_types = {
+        "ts": exp.DataType.build("TIMESTAMP"),
+        "ts_tz": exp.DataType.build("TIMESTAMP WITH TIME ZONE"),
+    }
+
+    delta_columns_to_types = adapter._to_delta_ts(columns_to_types)
+
+    # With empty custom mapping, should fall back to defaults
+    assert delta_columns_to_types == {
+        "ts": ts6,
+        "ts_tz": ts3_tz,
+    }
